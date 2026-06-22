@@ -14,15 +14,21 @@
 
 ## 📦 下载说明
 
-根据使用场景选择对应附件:
+根据使用场景选择对应附件。所有预编译二进制均为 **Linux x86-64** 架构,无需安装 Python 即可运行。
 
-| 附件 | 适合人群 | 说明 |
-|------|---------|------|
-| **`qr-file-station.tar.gz`** (95 MB) | 想在 Linux 服务器上一键部署整套服务 | 包含前端 Docker 镜像、Python 编码器、部署脚本。解压后 `./qr-file-station.sh deploy && start` 即可 |
-| **`qr-terminal-browser-linux-x86_64.tar.gz`** (9.4 MB) | 只想在 Linux 终端展示二维码,不想装 Python | 解压后直接 `./qr-terminal-browser --input-dir /path/to/files`,无需依赖 |
-| **`qr-terminal-browser-source.tar.gz`** (11 KB) | 想在目标 Linux 机器上原生编译终端浏览器 | 含源码和 `build_native_linux_x86_64.sh` 脚本 |
+| 附件 | 大小 | 用途 |
+|------|------|------|
+| **`qr-file-station.tar.gz`** | 95 MB | 🐳 **完整离线部署包**:前端 Docker 镜像 + Python 编码器 + 部署脚本,一键拉起整套服务 |
+| **`file_to_qr-linux-x86_64`** | 21 MB | 📤 **编码器单文件**:把文件批量转成二维码 PNG。`./file_to_qr-linux-x86_64 /path/to/files /path/to/output` |
+| **`qr-terminal-browser-linux-x86_64.tar.gz`** | 9.4 MB | 📺 **终端浏览器单文件**:在 Linux 终端逐张展示二维码,无需图形界面 |
+| **`qr-terminal-browser-source.tar.gz`** | 11 KB | 📦 终端浏览器源码包,可在目标机器上原生编译 |
 
 > 💡 只想用 Python 源码或前端开发?直接 clone 本仓库即可,无需下载附件。
+
+### 典型组合
+
+- **完整离线流程**:编码器(`file_to_qr-linux-x86_64`)生成 PNG → 终端浏览器(`qr-terminal-browser`)展示 → 手机扫码
+- **只想部署 Web 服务**:下载 `qr-file-station.tar.gz`,内含 Docker 镜像和部署脚本
 
 ## 🚀 快速开始
 
@@ -61,6 +67,15 @@ cd qr-terminal-browser-linux-x86_64
 - `--module-width <n>`:终端窄时设为 `1` 压缩宽度
 - `--image-max-width <cols>`:浏览 PNG 时的最大列宽
 
+### 方式三:用预编译编码器(用 `file_to_qr-linux-x86_64`)
+
+```bash
+chmod +x file_to_qr-linux-x86_64
+
+# 把文件夹下所有文件转成二维码 PNG
+./file_to_qr-linux-x86_64 /path/to/files /path/to/output
+```
+
 ## 📖 工作原理
 
 1. **编码** (`file_to_qr.py`):读取文件 → Base64 → 按 384 字节切块 → 每块附 `{filename, size, index, total, data, checksum}` 元数据 → 用最高容错率(H,30%)生成 PNG
@@ -71,7 +86,7 @@ cd qr-terminal-browser-linux-x86_64
 
 - 大文件会产生非常多张二维码(384 字节/张),仅适合小体积文本/配置/凭证
 - 二维码容错率最高(H),但仍受屏幕分辨率、摄像头对焦、光线影响
-- 预编译二进制仅面向 **Linux x86-64**,其它平台请用源码运行
+- 预编译二进制**仅面向 Linux x86-64**(Ubuntu/Debian/CentOS/Rocky 等 glibc 发行版),不支持 ARM、Alpine(musl)、Windows、macOS。其它平台请 clone 仓库用 Python 源码运行
 
 ## 📄 许可证
 
