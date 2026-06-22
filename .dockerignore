@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+*.md
+.vscode
+.idea
+qr_output
+test_files
+app
+nginx.conf

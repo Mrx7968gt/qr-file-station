@@ -1,0 +1,92 @@
+Linux x86_64 可执行文件编译说明
+
+目标:
+  编译一个可复制到 Linux x86_64 主机运行的二维码终端浏览器。
+  当前源码包兼容 Python 3.7+。
+
+方式一: 上传到 Linux x86_64 服务器后编译（推荐）
+
+  先安装系统依赖:
+
+    Debian/Ubuntu:
+      sudo apt-get update
+      sudo apt-get install -y python3 python3-venv binutils
+
+    CentOS/RHEL/Rocky:
+      sudo yum install -y python3 binutils
+
+  tar -xzf qr-terminal-browser-source.tar.gz
+  cd qr-terminal-browser-source
+  chmod +x build_native_linux_x86_64.sh
+  ./build_native_linux_x86_64.sh
+
+  编译完成后会生成:
+
+    dist-linux-x86_64/qr-terminal-browser-linux-x86_64/qr-terminal-browser
+    dist-linux-x86_64/qr-terminal-browser-linux-x86_64.tar.gz
+
+  在同一台服务器运行:
+
+    tar -xzf dist-linux-x86_64/qr-terminal-browser-linux-x86_64.tar.gz
+    cd qr-terminal-browser-linux-x86_64
+    ./qr-terminal-browser --input-dir /path/to/files
+
+  如果终端里的二维码仍然太宽或太密，优先调小分块大小:
+
+    ./qr-terminal-browser --input-dir /path/to/files --chunk-size 100
+
+  如果终端窗口很窄，可以进一步压缩宽度，但扫码稳定性可能下降:
+
+    ./qr-terminal-browser --input-dir /path/to/files --chunk-size 100 --module-width 1
+
+  如果已经有 file_to_qr.py 生成的 PNG:
+
+    ./qr-terminal-browser --image-dir /path/to/qr_output
+    ./qr-terminal-browser --image-dir /path/to/qr_output --image-max-width 80
+
+方式二: 在 ARM 机器上用 Docker 交叉编译（可选）
+
+  前提:
+    1. 本机安装 Docker。
+    2. Docker 支持 linux/amd64 平台模拟。Docker Desktop 通常默认支持。
+    3. 目标 Linux 主机是 x86_64 glibc 环境，例如 Ubuntu、Debian、CentOS、Rocky Linux。
+
+  命令:
+
+    chmod +x build_linux_x86_64.sh
+    ./build_linux_x86_64.sh
+
+  编译完成后会生成:
+
+    dist-linux-x86_64/qr-terminal-browser-linux-x86_64/qr-terminal-browser
+    dist-linux-x86_64/qr-terminal-browser-linux-x86_64.tar.gz
+
+  复制到 Linux x86_64 主机:
+
+    scp dist-linux-x86_64/qr-terminal-browser-linux-x86_64.tar.gz user@linux-host:/tmp/
+
+手动编译方式:
+
+  python3 -m venv .venv-build
+  .venv-build/bin/python -m pip install --upgrade pip
+  .venv-build/bin/python -m pip install -r requirements.txt pyinstaller
+  .venv-build/bin/pyinstaller --clean --onefile \
+    --name qr-terminal-browser \
+    --hidden-import file_to_qr \
+    --hidden-import qrcode \
+    --hidden-import PIL \
+    terminal_qr_browser.py
+
+常用快捷键:
+
+  ↑/↓/j/k  选择二维码
+  n        下一张
+  p        上一张
+  q        退出
+
+注意:
+  1. 这个方式不是 Windows/macOS 可执行文件，只生成 Linux x86_64 可执行文件。
+  2. 如果目标机器是 Alpine Linux，建议换成普通 Ubuntu/Debian 系统运行，或单独做 musl 构建。
+  3. 如果目标机器没有图形界面也没关系，只要能显示终端即可。
+  4. 终端二维码默认使用每个模块 2 列 x 1 行显示，比例更接近真实方形，避免二维码变扁。
+  5. --image-max-width 只控制 --image-dir 读取 PNG 后的显示宽度；--input-dir 请用 --chunk-size 控制二维码尺寸。

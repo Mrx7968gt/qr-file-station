@@ -1,0 +1,57 @@
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 本项目根目录原本就是 Python 虚拟环境布局(bin/ lib/ include/ pyvenv.cfg),
+# 全部不入库。仅显式保留脚本与源码。
+/bin/
+/lib/
+/include/
+/pyvenv.cfg
+
+# ===== Node.js / 前端 =====
+node_modules/
+app/dist/
+app/node_modules/
+*.local
+
+# ===== 日志 / 运行时输出 =====
+*.log
+logs/
+
+# ===== 生成产物(走 GitHub Release,不入库) =====
+# 文件转二维码输出目录
+qr_output/
+
+# 编译产物目录
+dist/
+dist-linux-x86_64/
+
+# 大体积打包产物、Docker 镜像导出、预编译二进制
+*.tar
+*.tar.gz
+!qr-terminal-browser-source.tar.gz
+# 预编译可执行文件(走 GitHub Release)
+file_to_qr_arm
+file_to_qr_x86
+qr-file-station/
+文本转换二维码工具/
+
+# 测试文件(可能包含示例大文件)
+test_files/
+
+# ===== 敏感 / 本地配置 =====
+.env
+.env.*
+!.env.example

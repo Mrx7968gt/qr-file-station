@@ -1,0 +1,56 @@
+/* 扫描线动画 */
+@keyframes scan-line {
+  0% {
+    transform: translateY(-100px);
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(100px);
+    opacity: 0;
+  }
+}
+
+.animate-scan-line {
+  animation: scan-line 2s linear infinite;
+}
+
+/* 确保扫描器容器正确显示 */
+#qr-scanner-container {
+  position: relative;
+}
+
+#qr-scanner-container video {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* 移动端优化 */
+@media (max-width: 640px) {
+  .container {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}

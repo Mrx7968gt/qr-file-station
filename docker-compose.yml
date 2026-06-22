@@ -1,0 +1,27 @@
+services:
+  # 前端 Web 应用（二维码扫描 + 文件还原）
+  web:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: qr-file-web
+    ports:
+      - "8080:80"
+      - "8443:443"
+    restart: unless-stopped
+
+  # Python 编码工具（文件 → 二维码）
+  # 用法:
+  #   docker compose -p qr-file-station run --rm -e INPUT_DIR=/data/input -e OUTPUT_DIR=/data/output \
+  #     -v /宿主机输入目录:/data/input:ro -v /宿主机输出目录:/data/output encoder
+  encoder:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: qr-file-encoder
+    volumes:
+      - ${INPUT_DIR:-./test_files}:/data/input:ro
+      - ${OUTPUT_DIR:-./qr_output}:/data/output
+    entrypoint: ["python", "file_to_qr.py", "/data/input", "/data/output"]
+    profiles:
+      - tools
