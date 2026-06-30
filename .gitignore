@@ -51,6 +51,23 @@ qr-file-station/
 # 测试文件(可能包含示例大文件)
 test_files/
 
+# ===== 采集卡桥接方案(bridge)构建产物 =====
+# Windows 离线安装包(含 Python 安装包 + wheel,体积大,走外部渠道传输,不入库)
+dist-win64/
+dist-win64-sender.zip
+*.zip.bak
+
+# 离线 wheel 包
+wheels/
+
+# PyInstaller 本地打包产物(走 GitHub Actions 云打包,本地不产)
+build/win/__pycache__/
+build/win/dist/
+build/win/build/
+
+# 链路验证脚本的本地缓存
+recv/
+
 # ===== 敏感 / 本地配置 =====
 .env
 .env.*

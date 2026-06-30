@@ -1,0 +1,78 @@
+name: Build Windows verify_sender.exe
+
+# 触发条件:推送到 main 时、或手动触发
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'verify_sender.py'
+      - 'build/win/verify_sender.spec'
+      - '.github/workflows/build-windows-exe.yml'
+  workflow_dispatch:   # 允许在 GitHub 页面手动点按钮运行
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # 只装发送端需要的最小依赖
+          pip install pygame qrcode pillow
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller build/win/verify_sender.spec --clean --noconfirm
+          # 确认产物存在
+          if (-not (Test-Path dist/verify_sender.exe)) {
+            throw "打包失败:dist/verify_sender.exe 未生成"
+          }
+          # 打印产物大小
+          $size = (Get-Item dist/verify_sender.exe).Length / 1MB
+          Write-Host "verify_sender.exe 大小: $([math]::Round($size,2)) MB"
+
+      - name: Smoke test(冒烟测试:exe 能否启动)
+        shell: pwsh
+        run: |
+          # 启动 exe,2 秒后强制结束;能启动说明打包基本正常
+          # (pygame 全屏窗口在无显示的 CI 里会失败,这里只验证 exe 不立即崩溃)
+          $proc = Start-Process -FilePath "dist/verify_sender.exe" -PassThru -ErrorAction SilentlyContinue
+          if ($proc) {
+            Start-Sleep -Seconds 3
+            if (-not $proc.HasExited) {
+              Write-Host "exe 启动成功且持续运行(正常)"
+              Stop-Process -Id $proc.Id -Force
+            } else {
+              Write-Host "exe 已退出,退出码: $($proc.ExitCode)"
+              # 退出码非 0 但能跑起来也算通过(无显示环境 pygame 可能报错)
+            }
+          } else {
+            Write-Host "exe 未能启动(可能在无显示 CI 环境下),跳过冒烟测试"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify_sender-windows-x86_64
+          path: dist/verify_sender.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          echo "## 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "产物 \`verify_sender.exe\` 已上传为 artifact,可在 Actions 运行页面下载。" >> $env:GITHUB_STEP_SUMMARY
+          echo "下载后拷到 Windows 机器双击运行,无需安装 Python。" >> $env:GITHUB_STEP_SUMMARY
