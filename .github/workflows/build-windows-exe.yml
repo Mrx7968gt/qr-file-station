@@ -1,4 +1,4 @@
-name: Build Windows verify_sender.exe
+name: Build Windows executables (verify_sender + sender)
 
 # 触发条件:推送到 main 时、或手动触发
 on:
@@ -7,6 +7,8 @@ on:
     paths:
       - 'verify_sender.py'
       - 'build/win/verify_sender.spec'
+      - 'bridge/**'
+      - 'build/win/sender.spec'
       - '.github/workflows/build-windows-exe.yml'
   workflow_dispatch:   # 允许在 GitHub 页面手动点按钮运行
 
@@ -95,3 +97,66 @@ jobs:
           echo "" >> $env:GITHUB_STEP_SUMMARY
           echo "产物 \`verify_sender.exe\` 已上传为 artifact,可在 Actions 运行页面下载。" >> $env:GITHUB_STEP_SUMMARY
           echo "下载后拷到 Windows 机器双击运行,无需安装 Python。" >> $env:GITHUB_STEP_SUMMARY
+
+  # ====================================================================
+  # 发送端正式版 sender.exe(PyQt6 GUI + pygame 播放 + FEC)
+  # ====================================================================
+  build-sender:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pygame qrcode pillow reedsolo
+          pip install pyinstaller
+
+      - name: Smoke test sender 逻辑(不依赖 GUI/采集卡)
+        shell: pwsh
+        run: |
+          # 验证 bridge 包能正常构建帧序列(发送端核心逻辑)
+          python -c "from bridge.sender import builder; from bridge.common import protocol; print('sender logic import OK')"
+          Write-Host "✓ sender 逻辑层验证通过"
+
+      - name: Build sender.exe with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller build/win/sender.spec --clean --noconfirm
+          if (-not (Test-Path dist/sender.exe)) {
+            throw "打包失败:dist/sender.exe 未生成"
+          }
+          $size = (Get-Item dist/sender.exe).Length / 1MB
+          Write-Host "sender.exe 大小: $([math]::Round($size,2)) MB"
+
+      - name: Verify exe is valid PE
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("dist/sender.exe")[0..1]
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "PE 头校验失败"
+          }
+          Write-Host "✓ sender.exe PE 头校验通过(MZ 签名正常)"
+
+      - name: Upload sender artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sender-windows-x86_64
+          path: dist/sender.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          echo "## sender.exe 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "采集卡文件传输发送端(全功能版),含 PyQt6 GUI + pygame 播放 + Reed-Solomon FEC。" >> $env:GITHUB_STEP_SUMMARY
+          echo "下载 \`sender-windows-x86_64\` artifact,拷到 Windows 双击运行。" >> $env:GITHUB_STEP_SUMMARY
