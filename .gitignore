@@ -55,6 +55,11 @@ test_files/
 # Windows 离线安装包(含 Python 安装包 + wheel,体积大,走外部渠道传输,不入库)
 dist-win64/
 dist-win64-sender.zip
+
+# 最终交付压缩包 + 组装目录(exe + 离线包二合一,走外部渠道传输,不入库)
+qr-sender-windows-x86_64.zip
+qr-sender-windows-x86_64/
+dist-bundle/
 *.zip.bak
 
 # 离线 wheel 包
