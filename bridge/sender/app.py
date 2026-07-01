@@ -39,9 +39,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 def render_matrix_bytes(payload, box=10, border=4):
     """
-    帧 JSON → QR 矩阵的灰度字节。纯计算,无 Qt 依赖。
-    返回 (n, bytes):n=矩阵边长,bytes=灰度(黑0白255)。
-    可在任意线程/进程安全调用。模块级以便多进程 pickle。
+    帧 JSON → QR 矩阵的灰度字节(已按 box 放大,边缘锐利)。纯计算,无 Qt 依赖。
+
+    ★ 关键:在渲染时就把每个模块重复 box 次(近邻放大),而不是生成 1px/模块
+    的小图再用 SmoothTransformation 插值放大 —— 插值会让黑白边界变灰,二维码
+    无法识别。这里生成 box 放大后的位图,边缘是硬切的纯黑白。
+
+    Args:
+        payload: 帧 JSON 字符串
+        box: 每个模块的像素数(放大倍数,越大越清晰,但内存/时间略增)
+        border: QR 静区(白边)模块数
+
+    Returns:
+        (n, bytes):n=放大后的矩阵边长(像素),bytes=灰度(黑0白255)
     """
     import qrcode
     qr = qrcode.QRCode(
@@ -51,14 +61,24 @@ def render_matrix_bytes(payload, box=10, border=4):
     )
     qr.add_data(payload)
     qr.make(fit=True)
-    matrix = qr.get_matrix()
-    n = len(matrix)
+    matrix = qr.get_matrix()  # bool 二维矩阵,True=黑模块(box_size 在 get_matrix 不生效)
+    modules = len(matrix)     # 模块数(含 border)
+    n = modules * box         # ★ 放大后的像素边长
+    # 直接构造放大后的位图:每个模块占 box×box 像素,值相同(近邻,边缘锐利)
     data = bytearray(n * n)
-    for y in range(n):
-        row = matrix[y]
-        base = y * n
-        for x in range(n):
-            data[base + x] = 0 if row[x] else 255
+    for my in range(modules):
+        row = matrix[my]
+        # 该模块行对应的 box 个像素行
+        for by in range(box):
+            py = my * box + by
+            base = py * n
+            for mx in range(modules):
+                val = 0 if row[mx] else 255
+                # 填充该模块的 box 个像素
+                off = base + mx * box
+                for _ in range(box):
+                    data[off] = val
+                    off += 1
     return n, bytes(data)
 
 
@@ -257,8 +277,11 @@ def run_gui() -> int:
         avail = qr_label.size()
         if avail.width() < 2 or avail.height() < 2:
             return pm
+        # ★ 用 FastTransformation(最近邻)而非 SmoothTransformation(双线性):
+        # 二维码是纯黑白方格,插值会让边缘变灰导致识别率下降。
+        # 最近邻保持锐利的黑白边界,即使放大也不模糊。
         return pm.scaled(avail, Qt.AspectRatioMode.KeepAspectRatio,
-                         Qt.TransformationMode.SmoothTransformation)
+                         Qt.TransformationMode.FastTransformation)
 
     def compute_cache_key(paths, chunk_size, use_fec, fec_redundancy):
         import hashlib
