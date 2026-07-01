@@ -214,3 +214,30 @@ def loads(text: str) -> Optional[Dict]:
         return json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# QR 容量安全检查
+# ---------------------------------------------------------------------------
+# 重要:QR Version 40 + H 容错(30%)+ 字节/字母模式 实际承载约 1273 字节。
+# (2953 是 数字模式 + L容错 的理论极限,不适用于本场景)
+# 我们用 H 容错(保证采集卡解码可靠性),所以单帧 JSON 上限低得多。
+QR_MAX_SAFE_PAYLOAD = 1200   # 单帧 JSON 字节安全上限(H容错下)
+
+
+def fits_in_qr(payload: str, limit: int = QR_MAX_SAFE_PAYLOAD) -> bool:
+    """判断 payload(帧 JSON)是否能安全放进单个二维码(H容错)。"""
+    return len(payload.encode("utf-8")) <= limit
+
+
+def safe_chunk_size_for_payload(chunk_size: int) -> int:
+    """
+    给定期望的 chunk_size,估算一个能保证帧 JSON 不超 QR 容量的值。
+    帧 JSON ≈ 元数据固定开销(~150B)+ data(base64,长度≈chunk_size)。
+    H容错下单帧 JSON 上限约 1200B → data 安全上限约 1000B。
+    """
+    overhead = 200  # 元数据 + 边界余量
+    max_data = QR_MAX_SAFE_PAYLOAD - overhead  # ≈ 1000
+    if chunk_size > max_data:
+        return max_data
+    return chunk_size

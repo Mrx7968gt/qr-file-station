@@ -94,14 +94,21 @@ def build(
     if not files:
         raise ValueError("没有找到可传输的文件")
 
+    # ★ 安全降级:chunk_size 过大时帧 JSON 会超 QR Version 40 容量(2953B)。
+    # 自动降到安全值,避免生成超大二维码导致编码失败。
+    safe_max = protocol.safe_chunk_size_for_payload(chunk_size)
+    if chunk_size > safe_max:
+        chunk_size = safe_max
+
     sid = protocol.new_sid()
 
     # 逐文件分块
-    # FEC 是"跨文件统一分组":把所有文件的所有块拼成一个序列再做 RS,
-    # 这样整个会话共享一套冗余块,接收端统一恢复。
+    # FEC 采用"文件级"分组:每个文件独立做 RS 纠错,manifest 记录每文件元信息。
+    # FEC 元信息按文件存进 per_file_fec,最终一次性放进 start 帧下发,
+    # 避免每帧重复携带(导致 lengths 数组膨胀、可能超 QR 容量)。
     all_data_chunks: List[dict] = []   # 每个含 filename/size/index/total/data
     file_manifest: List[dict] = []     # [{filename, size, chunks}]
-    per_file_local_total: dict = {}    # filename -> 该文件块数(用于 index 重映射)
+    per_file_fec: dict = {}            # filename -> FECMeta.to_dict()
 
     # 注意:为了让 FEC 能跨文件恢复,我们给所有块的 index 做全局编号。
     # 但接收端 assembler 按 (sid, filename) 分组,且期望 index 在文件内 0-based。
@@ -137,28 +144,32 @@ def build(
                 fec_meta = None  # 块太多超 RS 上限,降级为无 FEC
 
         # 构造该文件的 data 帧 + fec 帧
-        # FEC 元信息放第一个 data 帧(或 start 帧);这里放 start 帧统一管理,
-        # 但多文件场景下每文件 FEC 不同 —— 放进各文件的帧里更稳妥。
-        # 折中:把 fec 元信息塞进该文件每个 data 帧的 extra(冗余但稳)。
-        fec_extra = {"fec": fec_meta.to_dict()} if fec_meta else None
-
+        # ★ FEC 元信息只放进 start 帧一次(避免每帧重复携带 lengths 数组导致膨胀/超 QR 容量)。
+        # 接收端在 start 帧拿到 FECMeta 后,后续 data/fec 帧无需再带。
+        # data 帧:不带 fec extra
         for c in data_chunks:
             frame = protocol.make_data_chunk(
                 c["filename"], c["size"], c["index"], c["total"],
-                c["data"], sid, extra=fec_extra,
+                c["data"], sid,
             )
             frames_json.append(protocol.dumps(frame))
 
+        # fec 帧:只标 is_fec,不带完整 fec meta
         for j, payload in fec_payloads:
             frame = protocol.make_data_chunk(
                 fp.name, c["size"], j, k, payload, sid,
-                extra={"is_fec": True, "fec": fec_meta.to_dict() if fec_meta else None},
+                extra={"is_fec": True},
             )
             frames_json.append(protocol.dumps(frame))
 
-    # 前后插哨兵帧
+        # 记录该文件的 FEC 元信息,放进 start 帧
+        if fec_meta:
+            per_file_fec[fp.name] = fec_meta.to_dict()
+
+    # 前后插哨兵帧。start 帧携带每文件的 FEC 元信息(一次性下发)
+    start_extra = {"fec": per_file_fec} if per_file_fec else None
     start_frame = protocol.make_start_frame(
-        sid, file_manifest, total_data_chunks
+        sid, file_manifest, total_data_chunks, extra=start_extra
     )
     end_frame = protocol.make_end_frame(sid)
     frames_json.insert(0, protocol.dumps(start_frame))

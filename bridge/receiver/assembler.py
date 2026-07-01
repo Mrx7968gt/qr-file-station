@@ -142,10 +142,27 @@ class Assembler:
         self.sessions[sid] = SessionState(sid=sid)
         sess = self.sessions[sid]
         sess.expected_files = frame.get("files", [])
-        # FEC 元信息(可选,跟随 start 帧下发)
-        fec_d = frame.get("fec")
-        if fec_d:
-            sess._fec_meta = fec.FECMeta.from_dict(fec_d)  # noqa: SLF001
+        # FEC 元信息:新协议按文件名下发(per_file_fec = {filename: FECMeta.to_dict()})
+        # 兼容旧协议:若 fec 是单个 dict(非 {filename:...}),则对所有文件用同一份
+        fec_field = frame.get("fec")
+        fec_by_file: Dict[str, "fec.FECMeta"] = {}
+        if fec_field:
+            if isinstance(fec_field, dict) and all(
+                isinstance(v, dict) for v in fec_field.values()
+            ):
+                # 新协议:{filename: meta_dict}
+                for fname, meta_d in fec_field.items():
+                    try:
+                        fec_by_file[fname] = fec.FECMeta.from_dict(meta_d)
+                    except Exception:
+                        pass
+            else:
+                # 旧协议:单个 meta dict,存为占位
+                try:
+                    sess._fec_meta = fec.FECMeta.from_dict(fec_field)  # noqa: SLF001
+                except Exception:
+                    pass
+        sess._fec_by_file = fec_by_file  # noqa: SLF001
 
     def _handle_data(self, frame: Dict) -> List[str]:
         sid = frame["sid"]
@@ -162,15 +179,10 @@ class Assembler:
         fname = frame["filename"]
         buf = sess.files.get(fname)
         if buf is None:
-            # FEC 元信息优先取自帧自身的 fec extra(builder 每帧都带);
-            # 回退取自 session(若 start 帧统一下发)
-            fec_meta = None
-            fec_d = frame.get("fec")
-            if fec_d:
-                try:
-                    fec_meta = fec.FECMeta.from_dict(fec_d)
-                except Exception:
-                    fec_meta = None
+            # FEC 元信息优先取自 start 帧的 per_file_fec(按文件名);
+            # 回退取自旧协议的 session._fec_meta
+            fec_by_file = getattr(sess, "_fec_by_file", {}) or {}
+            fec_meta = fec_by_file.get(fname)
             if fec_meta is None:
                 fec_meta = getattr(sess, "_fec_meta", None)
             buf = FileBuffer(

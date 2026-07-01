@@ -144,8 +144,11 @@ def test_single_file_with_loss_and_fec():
         # 用与 _run_one 完全相同的 redundancy 算 R,保证 drop_count ≤ 实际恢复能力
         result = builder.build([p], chunk_size=200, use_fec=True,
                                fec_redundancy=redundancy)
-        sample = P.loads(result.frames[1])
-        R = sample.get("fec", {}).get("n", 0) - sample.get("fec", {}).get("k", 0)
+        # FEC 元信息现在放在 start 帧(frames[0])的 per_file_fec 字典里
+        start_frame = P.loads(result.frames[0])
+        fec_by_file = start_frame.get("fec", {})
+        file_meta = fec_by_file.get("x.bin", {})
+        R = file_meta.get("n", 0) - file_meta.get("k", 0)
         assert R >= 2, f"FEC 冗余块不足: R={R}"
 
     ok = True
