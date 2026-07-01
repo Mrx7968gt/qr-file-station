@@ -26,13 +26,21 @@ def parse_frame(raw_bytes: bytes) -> Optional[Dict]:
         raw_bytes: pyzbar 返回的 o.data
 
     Returns:
-        帧 dict;解析失败返回 None
+        帧 dict;解析失败或非合法帧返回 None
+
+    注意:zbar 偶尔会把画面误识别成 DataBar 等其它码,返回纯数字/乱码,
+    JSON 解析后可能是 int/float/str 而非 dict。这里必须校验类型,
+    避免把垃圾数据传给 assembler 导致崩溃。
     """
     try:
         text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    return protocol.loads(text)
+    frame = protocol.loads(text)
+    # ★ 类型防御:必须是 dict,且含 type 字段(合法帧都有)
+    if not isinstance(frame, dict) or "type" not in frame:
+        return None
+    return frame
 
 
 def decode_all(raw_results: List) -> List[Dict]:

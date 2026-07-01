@@ -22,7 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import cv2
 import numpy as np
-from pyzbar.pyzbar import decode as pyzbar_decode
+from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
+
+# ★ 只识别 QR 码:zbar 默认会尝试所有码型(DataBar/Code128 等),
+# 常把采集卡画面误识别成其它码并触发 assertion 警告 + 垃圾数据。
+# 限定 QR_CODE 可大幅减少误识别。
+_QR_ONLY = [ZBarSymbol.QRCODE]
 
 from bridge.receiver import assembler as asm
 from bridge.receiver import decoder
@@ -78,7 +83,7 @@ def receive(
 
         attempts += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        raw_objs = pyzbar_decode(gray)
+        raw_objs = pyzbar_decode(gray, symbols=_QR_ONLY)
         frames = decoder.decode_all(raw_objs)
 
         # 处理本帧解码出的所有帧

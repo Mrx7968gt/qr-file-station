@@ -122,6 +122,9 @@ class Assembler:
             data  → 累积到对应文件缓冲,收齐则拼装落盘
             end   → 尝试对所有未完成的文件做 FEC 恢复收尾
         """
+        # ★ 类型防御:非法帧(非 dict / 缺字段)直接丢弃,避免崩溃
+        if not isinstance(frame, dict):
+            return []
         ftype = frame.get("type")
         sid = frame.get("sid", "")
         if not sid:
