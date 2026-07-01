@@ -39,9 +39,8 @@ hiddenimports += collect_submodules("bridge")
 hiddenimports += ["reedsolo"]
 # Qt 常见隐式依赖
 hiddenimports += ["PyQt6.sip"]
-# ★ 多进程并行渲染:Windows spawn 模式需要这些
-hiddenimports += ["multiprocessing", "multiprocessing.spawn",
-                  "multiprocessing.forkserver", "concurrent.futures"]
+# 渲染用多线程(ThreadPoolExecutor),需 concurrent.futures
+hiddenimports += ["concurrent.futures"]
 
 a = Analysis(
     [_ENTRY],

@@ -24,12 +24,6 @@ import json
 import os
 import sys
 
-# ★ 多进程 + PyInstaller 兼容:必须在最顶层调用
-# Windows spawn 模式下,子进程会重新执行本模块,freeze_support 处理这个情况。
-import multiprocessing
-if getattr(sys, "frozen", False):  # 仅 PyInstaller 打包后才调用
-    multiprocessing.freeze_support()
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 
@@ -80,13 +74,6 @@ def render_matrix_bytes(payload, box=10, border=4):
                     data[off] = val
                     off += 1
     return n, bytes(data)
-
-
-def _mp_render_one(args):
-    """多进程 worker:渲染单帧。args=(index, payload, box, border)。返回 (index, n, bytes)。"""
-    index, payload, box, border = args
-    n, data = render_matrix_bytes(payload, box, border)
-    return (index, n, data)
 
 
 # ============================================================================
@@ -317,45 +304,49 @@ def run_gui() -> int:
         except Exception:
             return False
 
-    # ===== 多进程渲染 worker(QRunnable,提交到 ProcessPool)=====
-    # 用 QThread 包装 ProcessPoolExecutor 的提交,通过信号回主线程
-    class MultiProcessRenderWorker(QThread):
+    # ===== 多线程渲染 worker(QThreadPool,同进程无 spawn 问题)=====
+    # ★ 为什么用多线程而非多进程:
+    #   多进程(ProcessPoolExecutor)在 PyInstaller 打包后,Windows spawn 模式
+    #   会在子进程的 __main__ 找不到 worker 函数(_mp_render_one)而崩溃。
+    #   多线程同进程,无此问题,PyInstaller 打包零适配。
+    #   代价:GIL 限制下不能多核并行,但 qrcode 的部分计算会释放 GIL,
+    #   且关键价值是「UI 不卡 + 边渲染边播放」,多线程已足够。
+    class MultiThreadRenderWorker(QThread):
         frame_ready = pyqtSignal(int, int, bytes)   # (idx, n, data)
         progress = pyqtSignal(int, int)             # (done, total)
         all_done = pyqtSignal()
-        def __init__(self, frames, box=10, border=4):
+        def __init__(self, frames, box=10, border=4, nthreads=0):
             super().__init__()
             self.frames = frames
             self.box = box
             self.border = border
+            # 线程数:默认用 CPU 核数(qrcode 部分计算释放 GIL,多线程仍有益)
+            self.nthreads = nthreads or max(1, (os.cpu_count() or 2))
             self._stop = False
         def stop(self):
             self._stop = True
         def run(self):
-            import concurrent.futures
+            from concurrent.futures import ThreadPoolExecutor
             total = len(self.frames)
-            nproc = max(1, (os.cpu_count() or 2) - 1)
-            args = [(i, payload, self.box, self.border)
-                    for i, payload in enumerate(self.frames)]
-            try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=nproc) as pool:
-                    futs = {pool.submit(_mp_render_one, a): a[0] for a in args}
-                    done_count = 0
-                    for fut in concurrent.futures.as_completed(futs):
-                        if self._stop:
-                            return
-                        idx, n, data = fut.result()
-                        self.frame_ready.emit(idx, n, data)
-                        done_count += 1
-                        self.progress.emit(done_count, total)
-            except Exception:
-                # 多进程失败(如 PyInstaller 环境)→ 回退单进程
+            done_count = 0
+            # 用 ThreadPoolExecutor 并发渲染;帧完成后立即发信号(边渲染边播放)
+            with ThreadPoolExecutor(max_workers=self.nthreads) as pool:
+                futs = {}
                 for i, payload in enumerate(self.frames):
                     if self._stop:
-                        return
-                    n, data = render_matrix_bytes(payload, self.box, self.border)
-                    self.frame_ready.emit(i, n, data)
-                    self.progress.emit(i + 1, total)
+                        break
+                    futs[pool.submit(render_matrix_bytes, payload, self.box, self.border)] = i
+                for fut in futs:  # 按提交顺序取(保证流式播放有序)
+                    if self._stop:
+                        break
+                    try:
+                        n, data = fut.result()
+                    except Exception:
+                        continue
+                    idx = futs[fut]
+                    self.frame_ready.emit(idx, n, data)
+                    done_count += 1
+                    self.progress.emit(done_count, total)
             self.all_done.emit()
 
     # ===== 转换单个文件(多进程并行渲染)=====
@@ -398,7 +389,7 @@ def run_gui() -> int:
         render_cache[ck] = {"result": result, "pixmaps": pixmaps, "rendered": False}
         status_label.setText(f"多进程渲染 {os.path.basename(fr['path'])}({len(result.frames)} 帧)…")
 
-        worker = MultiProcessRenderWorker(result.frames)
+        worker = MultiThreadRenderWorker(result.frames)
 
         def _frame(idx, n, data):
             pixmaps[idx] = pixmap_from_bytes(n, data)
@@ -446,7 +437,7 @@ def run_gui() -> int:
 
         # 若渲染未完成,继续后台渲染
         if not cached.get("rendered"):
-            worker = MultiProcessRenderWorker(result.frames)
+            worker = MultiThreadRenderWorker(result.frames)
             def _frame(idx, n, data):
                 pixmaps[idx] = pixmap_from_bytes(n, data)
                 play_state["render_done"] = len(pixmaps)
@@ -733,5 +724,4 @@ def run_gui() -> int:
 
 
 if __name__ == "__main__":
-    # 多进程入口:freeze_support 已在模块顶部调用
     sys.exit(main())
