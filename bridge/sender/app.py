@@ -132,8 +132,14 @@ def run_gui() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("采集卡文件传输 · 发送端")
 
+    # 读取版本号(窗口标题显示)
+    try:
+        from bridge.version import VERSION
+    except Exception:
+        VERSION = "?"
+
     window = QWidget()
-    window.setWindowTitle("采集卡文件传输 · 发送端")
+    window.setWindowTitle(f"采集卡文件传输 · 发送端 v{VERSION}")
     window.resize(900, 660)
 
     # 持久快捷键(防 GC,存为 window 属性)
@@ -318,7 +324,7 @@ def run_gui() -> int:
 
     class PixmapLRUCache:
         """带容量上限的 LRU 缓存。超出 max_size 淘汰最久未访问的帧。"""
-        def __init__(self, max_size=30):
+        def __init__(self, max_size=100):
             self._data = _OrderedDict()
             self.max_size = max_size
         def __contains__(self, idx):
@@ -452,7 +458,7 @@ def run_gui() -> int:
         # 这样 convert 秒级完成,内存恒定(不随帧数增长)
         render_cache[ck] = {
             "result": result,
-            "pixmaps": PixmapLRUCache(max_size=30),  # LRU:最多缓存30帧
+            "pixmaps": PixmapLRUCache(max_size=100),  # LRU:最多缓存100帧(~500MB)
             "rendered": True,  # 标记"已转换"(帧序列就绪,可播放/显帧)
         }
         file_table.item(row, 1).setText("已转换")
@@ -515,7 +521,38 @@ def run_gui() -> int:
         play_state["timer"] = timer
         play_info.setText(f"播放 {os.path.basename(fr['path'])}  第 1/{loops_spin.value()} 轮")
 
-    # ===== 播放循环(按需即时渲染当前帧,LRU 缓存防爆内存)=====
+    # ===== 播放循环(按需即时渲染当前帧,LRU 缓存防爆内存 + 后台预读)=====
+    # 预读:显示当前帧后,后台预热后续 N 帧,让播放始终领先、循环不卡顿
+    play_state["_prefetching"] = False  # 预读进行中标志(防重复启动)
+
+    def prefetch_ahead(current_idx, pixmaps, result, ahead=5):
+        """后台预读 ahead 帧(若未在缓存),放进 LRU。已在预读则跳过。"""
+        if play_state.get("_prefetching"):
+            return
+        total = len(result.frames)
+        # 收集需要预读的帧号(未在缓存)
+        need = []
+        for off in range(1, ahead + 1):
+            ni = (current_idx + off) % total
+            if pixmaps.get(ni) is None:
+                need.append(ni)
+        if not need:
+            return
+        play_state["_prefetching"] = True
+        # 用后台线程预读(不阻塞当前 tick)
+        worker = MultiThreadRenderWorker([result.frames[ni] for ni in need],
+                                         box=10, border=4, nthreads=2)
+        # need[i] 对应 worker.frames[i];渲染完成回填到正确 idx
+        def _frame(i, n, data):
+            real_idx = need[i]
+            pixmaps.put(real_idx, pixmap_from_bytes(n, data))
+        def _done():
+            play_state["_prefetching"] = False
+        worker.frame_ready.connect(_frame)
+        worker.all_done.connect(_done)
+        worker.start()
+        play_state["_prefetch_worker"] = worker  # 防 GC
+
     def on_tick():
         if play_state.get("mode") != "play":
             return
@@ -540,6 +577,8 @@ def run_gui() -> int:
         allf = play_state["total"] * play_state["loops"]
         pct = int(done / allf * 100) if allf else 0
         play_info.setText(f"第 {play_state['round']+1}/{play_state['loops']} 轮   帧 {idx+1}/{play_state['total']}   {pct}%")
+        # ★ 显示完当前帧后,后台预读后续帧(消除循环/连续播放的卡顿)
+        prefetch_ahead(idx, pixmaps, result, ahead=5)
         play_state["idx"] += 1
         if play_state["idx"] >= play_state["total"]:
             play_state["round"] += 1
@@ -772,7 +811,7 @@ def run_gui() -> int:
                         self.put(idx, pm)
                         return pm
                 return None
-        pixmaps = _DiskBackedLRU(max_size=30)
+        pixmaps = _DiskBackedLRU(max_size=100)
         # 预加载前几帧(让首屏快速显示)
         loaded = 0
         for idx in range(min(total, 30)):
@@ -808,6 +847,15 @@ def run_gui() -> int:
         t = play_state.get("timer")
         if t:
             t.stop(); play_state["timer"] = None
+        # 停预读 worker(若在运行)
+        play_state["_prefetching"] = False
+        pw = play_state.get("_prefetch_worker")
+        if pw is not None:
+            try:
+                pw.stop(); pw.wait(1000)
+            except Exception:
+                pass
+            play_state["_prefetch_worker"] = None
         _disable_nav_shortcuts()
         play_state["mode"] = None
 

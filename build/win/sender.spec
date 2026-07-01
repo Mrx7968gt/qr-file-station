@@ -22,6 +22,14 @@ _ROOT = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
 # 入口:发送端 GUI/CLI 主程序
 _ENTRY = os.path.join(_ROOT, "bridge", "sender", "app.py")
 
+# ★ 读取版本号 → exe 文件名带版本(如 sender-1.1.0.exe)
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("version", os.path.join(_ROOT, "bridge", "version.py"))
+_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+VERSION = _mod.VERSION
+_EXE_NAME = f"sender-v{VERSION}"
+
 # 收集隐式数据文件(字体、Qt 插件、翻译、图标等资源)
 datas = []
 datas += collect_data_files("qrcode")
@@ -77,7 +85,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="sender",
+    name=_EXE_NAME,  # 如 sender-v1.1.0
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

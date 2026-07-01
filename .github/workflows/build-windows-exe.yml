@@ -35,37 +35,51 @@ jobs:
           python -c "from bridge.sender import builder; from bridge.common import protocol; print('sender logic import OK')"
           Write-Host "✓ sender 逻辑层验证通过"
 
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          # 从 bridge/version.py 读取版本号
+          $verLine = Get-Content bridge/version.py | Select-String 'VERSION = "([^"]+)"'
+          $ver = $verLine.Matches.Groups[1].Value
+          Write-Host "版本号: $ver"
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "exe_name=sender-v$ver.exe" >> $env:GITHUB_OUTPUT
+
       - name: Build sender.exe with PyInstaller
         shell: pwsh
         run: |
           pyinstaller build/win/sender.spec --clean --noconfirm
-          if (-not (Test-Path dist/sender.exe)) {
-            throw "打包失败:dist/sender.exe 未生成"
+          $exe = "dist/sender-v${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) {
+            throw "打包失败:$exe 未生成"
           }
-          $size = (Get-Item dist/sender.exe).Length / 1MB
-          Write-Host "sender.exe 大小: $([math]::Round($size,2)) MB"
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host "$exe 大小: $([math]::Round($size,2)) MB"
 
       - name: Verify exe is valid PE
         shell: pwsh
         run: |
-          $bytes = [System.IO.File]::ReadAllBytes("dist/sender.exe")[0..1]
+          $exe = "dist/sender-v${{ steps.ver.outputs.version }}.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)[0..1]
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
             throw "PE 头校验失败"
           }
-          Write-Host "✓ sender.exe PE 头校验通过(MZ 签名正常)"
+          Write-Host "✓ PE 头校验通过(MZ 签名正常)"
 
       - name: Upload sender artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sender-windows-x86_64
-          path: dist/sender.exe
+          name: sender-v${{ steps.ver.outputs.version }}-windows-x86_64
+          path: dist/sender-v${{ steps.ver.outputs.version }}.exe
           if-no-files-found: error
           retention-days: 30
 
       - name: Summary
         shell: pwsh
         run: |
-          echo "## sender.exe 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
+          $ver = "${{ steps.ver.outputs.version }}"
+          echo "## sender-v$ver.exe 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
-          echo "采集卡文件传输发送端(全功能版),含 PyQt6 GUI + 多线程渲染 + Reed-Solomon FEC。" >> $env:GITHUB_STEP_SUMMARY
-          echo "下载 \`sender-windows-x86_64\` artifact,拷到 Windows 双击运行。" >> $env:GITHUB_STEP_SUMMARY
+          echo "采集卡文件传输发送端 v$ver,含 PyQt6 GUI + 多线程渲染 + LRU缓存 + Reed-Solomon FEC。" >> $env:GITHUB_STEP_SUMMARY
+          echo "下载 \`sender-v$ver-windows-x86_64\` artifact,拷到 Windows 双击运行。" >> $env:GITHUB_STEP_SUMMARY
