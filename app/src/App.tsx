@@ -33,13 +33,24 @@ function App() {
   // 用于去重扫描（防止同一二维码被多次处理）
   const scannedChunks = useRef<Set<string>>(new Set());
 
-  // 处理扫描成功
+  // 处理扫描成功(适配 v2 协议:忽略 start/end 哨兵帧和 FEC 冗余帧)
   const handleScanSuccess = useCallback((decodedText: string) => {
     try {
       // 解析JSON数据
       const chunk: QRChunk = JSON.parse(decodedText);
 
-      // 验证数据格式
+      // ★ v2 协议适配:忽略非数据帧
+      // - type === 'start'/'end':会话哨兵帧,接收端不拼装,但可提示会话开始/结束
+      // - is_fec === true:FEC 冗余帧(Web 端不做 FEC 恢复,靠发送端循环重发兜底)
+      //   注意:冗余帧的 data 是冗余字节的 base64,不能当数据块拼装,否则文件损坏
+      if (chunk.type === 'start' || chunk.type === 'end') {
+        return; // 静默忽略哨兵帧
+      }
+      if (chunk.is_fec === true) {
+        return; // 静默忽略 FEC 冗余帧
+      }
+
+      // 验证数据格式(真正的数据帧必须有 filename/index/total/data)
       if (
         !chunk.filename ||
         typeof chunk.index !== 'number' ||
@@ -62,7 +73,7 @@ function App() {
 
       // 创建唯一标识用于去重
       const chunkId = `${chunk.filename}_${chunk.index}`;
-      
+
       // 检查是否已经扫描过这个块
       if (scannedChunks.current.has(chunkId)) {
         setScanStatus({
@@ -98,7 +109,7 @@ function App() {
             receivedChunks: new Map([[chunk.index, chunk.data]]),
             lastUpdated: Date.now(),
           };
-          newFiles.set(chunk.filename, newFileState);
+          newFiles.set(chunk.filename, newFile);
         }
 
         return newFiles;
