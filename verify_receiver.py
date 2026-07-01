@@ -22,6 +22,7 @@ import sys
 from datetime import datetime
 
 import cv2
+import numpy as np
 from pyzbar.pyzbar import decode
 
 # 与 verify_sender.py 一致
@@ -87,9 +88,10 @@ def main() -> None:
                 last_log = now
             for o in objs:
                 text = o.data.decode("utf-8", errors="replace")
-                pts = [[(p.x, p.y) for p in o.polygon]]
+                # OpenCV 4.x 的 polylines 要求 int32 numpy 数组
+                pts = np.array([[p.x, p.y] for p in o.polygon], dtype=np.int32)
                 # 画框 + 截断显示
-                cv2.polylines(frame, pts, True, (0, 255, 0), 3)
+                cv2.polylines(frame, [pts], True, (0, 255, 0), 3)
                 short = text if len(text) <= 60 else text[:57] + "..."
                 cv2.putText(frame, short, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
