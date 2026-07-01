@@ -78,3 +78,4 @@ recv/
 .env.*
 !.env.example
 recv_probe/
+sender_debug.log

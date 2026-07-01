@@ -19,10 +19,28 @@ bridge.sender.app — 发送端 PyQt6 主程序(GUI + CLI)
 
 from __future__ import annotations
 
+import datetime
 import io
 import json
+import logging
 import os
 import sys
+
+# ===== 文件日志(写到程序所在目录,便于调试显帧等问题)=====
+# PyInstaller 打包后 sys.executable 是 exe 路径,源码运行用 __file__
+_LOG_DIR = os.path.dirname(os.path.abspath(getattr(sys, "frozen", False)
+                                           and sys.executable or __file__))
+_LOG_PATH = os.path.join(_LOG_DIR, "sender_debug.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("sender")
+log.info("=" * 50)
+log.info(f"程序启动,日志文件: {_LOG_PATH}")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
@@ -370,7 +388,7 @@ def run_gui() -> int:
             fr["result"] = cached["result"]
             fr["rendered"] = True
             file_table.item(row, 1).setText("已转换")
-            file_table.item(row, 2).setText(str(len(cached["result"].frames)))
+            file_table.item(row, 2).setText(str(cached["result"].total_data_chunks))
             status_label.setText(f"✓ {os.path.basename(fr['path'])} 命中缓存。")
             return
 
@@ -382,12 +400,13 @@ def run_gui() -> int:
             QMessageBox.critical(window, "转换失败", str(e))
             return
         fr["result"] = result
-        file_table.item(row, 2).setText(str(len(result.frames)))
+        # ★ "块数"列显示数据帧数(与前端一致),渲染进度用全部帧数(含哨兵+FEC)
+        file_table.item(row, 2).setText(str(result.total_data_chunks))
         file_table.item(row, 1).setText("渲染中 0/%d" % len(result.frames))
 
         pixmaps = {}
         render_cache[ck] = {"result": result, "pixmaps": pixmaps, "rendered": False}
-        status_label.setText(f"多进程渲染 {os.path.basename(fr['path'])}({len(result.frames)} 帧)…")
+        status_label.setText(f"渲染 {os.path.basename(fr['path'])}(数据{result.total_data_chunks}块/共{len(result.frames)}帧)…")
 
         worker = MultiThreadRenderWorker(result.frames)
 
@@ -399,7 +418,7 @@ def run_gui() -> int:
             render_cache[ck]["rendered"] = True
             fr["rendered"] = True
             file_table.item(row, 1).setText("已转换")
-            status_label.setText(f"✓ {os.path.basename(fr['path'])} 渲染完成,{len(result.frames)} 帧。")
+            status_label.setText(f"✓ {os.path.basename(fr['path'])} 渲染完成(数据{result.total_data_chunks}块)。")
 
         worker.frame_ready.connect(_frame)
         worker.all_done.connect(_done)
@@ -486,53 +505,85 @@ def run_gui() -> int:
 
     # ===== 显帧(输入帧号 → 全屏静态显示 + 左右键翻页)=====
     def show_frame_dialog(row):
-        if row < 0 or row >= len(file_rows):
-            return
-        fr = file_rows[row]
-        ck = fr.get("cache_key")
-        cached = render_cache.get(ck) if ck else None
-        if not cached:
-            QMessageBox.information(window, "提示", "请先点「转换」生成该文件的二维码。")
-            return
-        total = len(cached["result"].frames)
-        idx, ok = QInputDialog.getInt(
-            window, "显示指定帧",
-            f"输入要显示的帧号(1~{total}):\n(用于补扫接收端漏掉的某帧)\n显示后可用 ← → 翻页",
-            value=1, minValue=1, maxValue=total,
-        )
-        if not ok:
-            return
-        enter_show_single(row, idx - 1)
+        log.info(f"[显帧] 点击显帧, row={row}")
+        try:
+            if row < 0 or row >= len(file_rows):
+                log.warning(f"[显帧] row 越界: {row} / {len(file_rows)}")
+                return
+            fr = file_rows[row]
+            ck = fr.get("cache_key")
+            log.info(f"[显帧] cache_key={ck}")
+            cached = render_cache.get(ck) if ck else None
+            if not cached:
+                log.warning(f"[显帧] 缓存为空,未转换")
+                QMessageBox.information(window, "提示", "请先点「转换」生成该文件的二维码。")
+                return
+            result = cached["result"]
+            total = len(result.frames)
+            log.info(f"[显帧] 总帧数={total}, 已渲染={len(cached['pixmaps'])}, rendered={cached.get('rendered')}")
+            idx, ok = QInputDialog.getInt(
+                window, "显示指定帧",
+                f"输入要显示的帧号(1~{total}):\n(用于补扫接收端漏掉的某帧)\n显示后可用 ← → 翻页",
+                value=1, minValue=1, maxValue=total,
+            )
+            if not ok:
+                log.info("[显帧] 用户取消输入")
+                return
+            log.info(f"[显帧] 用户输入帧号={idx}, 进入显示")
+            enter_show_single(row, idx - 1)
+        except Exception as e:
+            log.exception(f"[显帧] show_frame_dialog 异常: {e}")
+            QMessageBox.critical(window, "显帧错误", f"显帧出错: {e}\n详情见 sender_debug.log")
 
     def enter_show_single(row, idx):
         """进入单帧显示模式。"""
-        fr = file_rows[row]
-        ck = fr["cache_key"]
-        cached = render_cache[ck]
-        result = cached["result"]
-        pixmaps = cached["pixmaps"]
+        log.info(f"[显帧] enter_show_single row={row} idx={idx}")
+        try:
+            fr = file_rows[row]
+            ck = fr["cache_key"]
+            cached = render_cache.get(ck)
+            if not cached:
+                log.error(f"[显帧] 缓存丢失 ck={ck}")
+                return
+            result = cached["result"]
+            pixmaps = cached["pixmaps"]
+            log.info(f"[显帧] result.frames={len(result.frames)}, pixmaps={len(pixmaps)}, idx={idx}")
 
-        play_state.update({
-            "mode": "show_single", "current_row": row,
-            "pixmaps": pixmaps, "frames": result.frames,
-            "total": len(result.frames), "result": result,
-            "cache_key": ck, "single_idx": idx,
-            "timer": None,
-        })
+            play_state.update({
+                "mode": "show_single", "current_row": row,
+                "pixmaps": pixmaps, "frames": result.frames,
+                "total": len(result.frames), "result": result,
+                "cache_key": ck, "single_idx": idx,
+                "timer": None,
+            })
 
-        # 切到播放页全屏
-        ctrl_page.setVisible(False)
-        play_page.setVisible(True)
-        window.showFullScreen()
-        app.processEvents()
+            # 切到播放页全屏
+            ctrl_page.setVisible(False)
+            play_page.setVisible(True)
+            window.showFullScreen()
+            app.processEvents()
+            log.info("[显帧] 已切全屏")
 
-        # 确保该帧已渲染(没有就同步渲染单帧,很快)
-        if not ensure_rendered(idx, pixmaps, result):
-            play_info.setText("该帧渲染失败。")
-            return
-        display_single(idx)
-        # 启用持久快捷键(防 GC)
-        _enable_nav_shortcuts()
+            # 确保该帧已渲染(没有就同步渲染单帧,很快)
+            if not ensure_rendered(idx, pixmaps, result):
+                log.error(f"[显帧] 帧渲染失败 idx={idx}")
+                play_info.setText("该帧渲染失败。")
+                return
+            log.info(f"[显帧] 帧已就绪 idx={idx}, 显示中")
+            display_single(idx)
+            # 启用持久快捷键(防 GC)
+            _enable_nav_shortcuts()
+            log.info("[显帧] 快捷键已启用,等待用户操作")
+        except Exception as e:
+            log.exception(f"[显帧] enter_show_single 异常: {e}")
+            # 异常时回到控制页,不退出程序
+            try:
+                play_page.setVisible(False)
+                ctrl_page.setVisible(True)
+                window.showNormal()
+            except Exception:
+                pass
+            QMessageBox.critical(window, "显帧错误", f"显帧出错: {e}\n详情见 sender_debug.log")
 
     def display_single(idx):
         """显示单帧(已确保渲染)。"""
@@ -598,6 +649,7 @@ def run_gui() -> int:
             "use_fec": fec_check.isChecked(),
             "fec_redundancy": redundancy_spin.value() / 100.0,
             "total_frames": len(result.frames),
+            "total_data_chunks": result.total_data_chunks,  # 数据帧数(前端口径)
             "frames": result.frames,  # 所有帧 JSON
             "sid": result.sid,
         }
@@ -639,10 +691,20 @@ def run_gui() -> int:
             return
         frames = meta["frames"]
         total = meta["total_frames"]
+        # 数据帧数:优先用 meta 里的 total_data_chunks,老文件回退计算
+        total_data_chunks = meta.get("total_data_chunks")
+        if total_data_chunks is None:
+            # 老保存文件没有此字段:从 frames 里统计数据帧
+            import json as _json
+            total_data_chunks = sum(
+                1 for fj in frames
+                if _json.loads(fj).get("type") == "data"
+                and not _json.loads(fj).get("is_fec")
+            )
         # 重建 result(用 builder 的 BuildResult)
         from bridge.sender.builder import BuildResult
         result = BuildResult(sid=meta.get("sid", ""), frames=frames,
-                             file_count=1, total_data_chunks=total)
+                             file_count=1, total_data_chunks=total_data_chunks)
         # 加载 PNG
         pixmaps = {}
         from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
@@ -669,9 +731,9 @@ def run_gui() -> int:
         fr["cache_key"] = ck
         fr["result"] = result
         fr["rendered"] = (loaded >= total)
-        file_table.item(row, 1).setText(f"已加载 {loaded}/{total}")
-        file_table.item(row, 2).setText(str(total))
-        status_label.setText(f"✓ 从 {d} 加载 {loaded}/{total} 帧,可直接播放/显帧。")
+        file_table.item(row, 1).setText(f"已加载 {loaded}/{total}帧")
+        file_table.item(row, 2).setText(str(total_data_chunks))
+        status_label.setText(f"✓ 从 {d} 加载 {loaded}/{total} 帧(数据{total_data_chunks}块),可直接播放/显帧。")
 
     # ===== 结束/停止 =====
     def finish_playback(completed: bool):
