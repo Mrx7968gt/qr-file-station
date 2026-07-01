@@ -24,7 +24,6 @@ _ENTRY = os.path.join(_ROOT, "bridge", "sender", "app.py")
 
 # 收集隐式数据文件(字体、Qt 插件、翻译、图标等资源)
 datas = []
-datas += collect_data_files("pygame")
 datas += collect_data_files("qrcode")
 datas += collect_data_files("PIL")
 datas += collect_data_files("PyQt6")
@@ -34,7 +33,6 @@ datas += collect_data_files("PyQt6.QtWidgets")
 
 # 隐式导入
 hiddenimports = []
-hiddenimports += collect_submodules("pygame")
 hiddenimports += collect_submodules("qrcode")
 hiddenimports += collect_submodules("bridge")
 # reedsolo 是纯 Python 单文件,显式声明
@@ -52,6 +50,8 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # GUI 已改用纯 PyQt6 播放(QLabel+QPixmap+QTimer),不再需要 pygame
+        "pygame",
         # 排除接收端才用的大库,缩小体积
         "cv2",
         "numpy",
