@@ -71,8 +71,15 @@ function App() {
         return;
       }
 
+      // 校验已通过,提取确定类型的字段(避免 string|undefined 类型问题)
+      const filename: string = chunk.filename!;
+      const index: number = chunk.index!;
+      const total: number = chunk.total!;
+      const data: string = chunk.data!;
+      const size: number | undefined = chunk.size;
+
       // 创建唯一标识用于去重
-      const chunkId = `${chunk.filename}_${chunk.index}`;
+      const chunkId = `${filename}_${index}`;
 
       // 检查是否已经扫描过这个块
       if (scannedChunks.current.has(chunkId)) {
@@ -93,42 +100,42 @@ function App() {
       // 更新文件状态
       setFiles((prevFiles) => {
         const newFiles = new Map(prevFiles);
-        const existingFile = newFiles.get(chunk.filename);
+        const existingFile = newFiles.get(filename);
 
         if (existingFile) {
           // 更新现有文件
-          existingFile.receivedChunks.set(chunk.index, chunk.data);
+          existingFile.receivedChunks.set(index, data);
           existingFile.lastUpdated = Date.now();
-          newFiles.set(chunk.filename, existingFile);
+          newFiles.set(filename, existingFile);
         } else {
           // 创建新文件记录
           const newFileState: FileReceiveState = {
-            filename: chunk.filename,
-            totalSize: chunk.size,
-            totalChunks: chunk.total,
-            receivedChunks: new Map([[chunk.index, chunk.data]]),
+            filename,
+            totalSize: size ?? 0,
+            totalChunks: total,
+            receivedChunks: new Map([[index, data]]),
             lastUpdated: Date.now(),
           };
-          newFiles.set(chunk.filename, newFile);
+          newFiles.set(filename, newFileState);
         }
 
         return newFiles;
       });
 
       // 更新扫描状态
-      const isComplete = chunk.index + 1 >= chunk.total;
+      const isComplete = index + 1 >= total;
       setScanStatus({
         isScanning,
-        lastScannedFilename: chunk.filename,
-        lastScannedChunk: chunk.index,
-        totalChunks: chunk.total,
-        message: isComplete ? '文件接收完成！' : `成功接收块 ${chunk.index + 1}/${chunk.total}`,
+        lastScannedFilename: filename,
+        lastScannedChunk: index,
+        totalChunks: total,
+        message: isComplete ? '文件接收完成！' : `成功接收块 ${index + 1}/${total}`,
         messageType: 'success',
       });
 
       // 显示toast通知
       toast.success(
-        `已接收: ${chunk.filename} (${chunk.index + 1}/${chunk.total})`,
+        `已接收: ${filename} (${index + 1}/${total})`,
         { duration: 2000 }
       );
 
