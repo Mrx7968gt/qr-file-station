@@ -311,13 +311,46 @@ def run_gui() -> int:
         img = QImage(data, n, n, n, QImage.Format.Format_Grayscale8).copy()
         return QPixmap.fromImage(img)
 
+    # ===== LRU 缓存:防止大文件所有帧常驻内存导致爆内存 =====
+    # 单帧 box=10 时约 5MB,1000帧=5GB 必爆。
+    # LRU 限制缓存的帧数,超出淘汰最旧的,内存恒定。
+    from collections import OrderedDict as _OrderedDict
+
+    class PixmapLRUCache:
+        """带容量上限的 LRU 缓存。超出 max_size 淘汰最久未访问的帧。"""
+        def __init__(self, max_size=30):
+            self._data = _OrderedDict()
+            self.max_size = max_size
+        def __contains__(self, idx):
+            return idx in self._data
+        def __len__(self):
+            return len(self._data)
+        def get(self, idx):
+            """访问 idx,标记为最近使用。返回 pixmap 或 None。"""
+            if idx not in self._data:
+                return None
+            self._data.move_to_end(idx)
+            return self._data[idx]
+        def put(self, idx, pm):
+            """存入 pixmap,超出容量淘汰最旧的。"""
+            if idx in self._data:
+                self._data.move_to_end(idx)
+            self._data[idx] = pm
+            while len(self._data) > self.max_size:
+                self._data.popitem(last=False)  # 淘汰最旧的
+        def keys(self):
+            return list(self._data.keys())
+
     def ensure_rendered(idx, pixmaps, result):
-        """确保某帧已渲染(若没有则同步渲染单帧,很快)。返回 True 表示已就绪。"""
-        if idx in pixmaps:
+        """
+        确保某帧已渲染并在缓存中(若没有则同步渲染单帧)。
+        pixmaps 是 PixmapLRUCache。返回 True 表示已就绪。
+        """
+        if pixmaps.get(idx) is not None:
             return True
         try:
             n, data = render_matrix_bytes(result.frames[idx])
-            pixmaps[idx] = pixmap_from_bytes(n, data)
+            pixmaps.put(idx, pixmap_from_bytes(n, data))
             return True
         except Exception:
             return False
@@ -380,7 +413,7 @@ def run_gui() -> int:
                 log.info(f"全部 {total} 帧渲染完成")
             self.all_done.emit()
 
-    # ===== 转换单个文件(多进程并行渲染)=====
+    # ===== 转换单个文件(只 build 帧序列,不预渲染——按需渲染防爆内存)=====
     def convert_file(row):
         if row < 0 or row >= len(file_rows):
             return
@@ -395,6 +428,43 @@ def run_gui() -> int:
         ck = compute_cache_key([fr["path"]], chunk_size, use_fec, fec_redundancy)
         fr["cache_key"] = ck
 
+        # 缓存命中(已 build 过)?
+        cached = render_cache.get(ck)
+        if cached:
+            fr["result"] = cached["result"]
+            fr["rendered"] = True
+            file_table.item(row, 1).setText("已转换")
+            file_table.item(row, 2).setText(str(cached["result"].total_data_chunks))
+            status_label.setText(f"✓ {os.path.basename(fr['path'])} 命中缓存。")
+            return
+
+        status_label.setText(f"构建帧序列 {os.path.basename(fr['path'])}…")
+        app.processEvents()
+        try:
+            result = builder.build([fr["path"]], chunk_size=chunk_size,
+                                   use_fec=use_fec, fec_redundancy=fec_redundancy)
+        except Exception as e:
+            file_table.item(row, 1).setText("转换失败")
+            QMessageBox.critical(window, "转换失败", str(e))
+            return
+        fr["result"] = result
+        # ★ 不再全量预渲染!只存帧序列,渲染推迟到播放/显帧时按需进行(LRU 缓存防爆内存)
+        # 这样 convert 秒级完成,内存恒定(不随帧数增长)
+        render_cache[ck] = {
+            "result": result,
+            "pixmaps": PixmapLRUCache(max_size=30),  # LRU:最多缓存30帧
+            "rendered": True,  # 标记"已转换"(帧序列就绪,可播放/显帧)
+        }
+        file_table.item(row, 1).setText("已转换")
+        file_table.item(row, 2).setText(str(result.total_data_chunks))
+        status_label.setText(
+            f"✓ {os.path.basename(fr['path'])} 就绪:数据{result.total_data_chunks}块/共{len(result.frames)}帧。"
+            f"点「播放」开始(边播边渲染)或「显帧」补扫。"
+        )
+        log.info(f"[转换] {os.path.basename(fr['path'])} 帧序列就绪 {len(result.frames)} 帧(按需渲染)")
+        ck = compute_cache_key([fr["path"]], chunk_size, use_fec, fec_redundancy)
+        fr["cache_key"] = ck
+
         # 缓存命中?
         cached = render_cache.get(ck)
         if cached and cached.get("rendered"):
@@ -404,56 +474,6 @@ def run_gui() -> int:
             file_table.item(row, 2).setText(str(cached["result"].total_data_chunks))
             status_label.setText(f"✓ {os.path.basename(fr['path'])} 命中缓存。")
             return
-
-        try:
-            result = builder.build([fr["path"]], chunk_size=chunk_size,
-                                   use_fec=use_fec, fec_redundancy=fec_redundancy)
-        except Exception as e:
-            file_table.item(row, 1).setText("转换失败")
-            QMessageBox.critical(window, "转换失败", str(e))
-            return
-        fr["result"] = result
-        # ★ "块数"列显示数据帧数(与前端一致),渲染进度用全部帧数(含哨兵+FEC)
-        file_table.item(row, 2).setText(str(result.total_data_chunks))
-        file_table.item(row, 1).setText("渲染中 0/%d" % len(result.frames))
-
-        pixmaps = {}
-        render_cache[ck] = {"result": result, "pixmaps": pixmaps, "rendered": False}
-        status_label.setText(f"渲染 {os.path.basename(fr['path'])}(数据{result.total_data_chunks}块/共{len(result.frames)}帧)…")
-
-        worker = MultiThreadRenderWorker(result.frames)
-
-        def _frame(idx, n, data):
-            pixmaps[idx] = pixmap_from_bytes(n, data)
-            file_table.item(row, 1).setText(f"渲染 {len(pixmaps)}/{len(result.frames)}")
-
-        def _done():
-            # ★ 根据实际渲染数判断完成状态(避免静默失败导致标记错误)
-            rendered_count = len(pixmaps)
-            total_count = len(result.frames)
-            fully_done = (rendered_count >= total_count)
-            render_cache[ck]["rendered"] = fully_done
-            fr["rendered"] = fully_done
-            if fully_done:
-                file_table.item(row, 1).setText("已转换")
-                status_label.setText(f"✓ {os.path.basename(fr['path'])} 渲染完成(数据{result.total_data_chunks}块)。")
-                log.info(f"[转换] {os.path.basename(fr['path'])} 全部 {total_count} 帧渲染完成")
-            else:
-                file_table.item(row, 1).setText(f"部分完成 {rendered_count}/{total_count}")
-                status_label.setText(
-                    f"⚠ {os.path.basename(fr['path'])} 只渲染 {rendered_count}/{total_count} 帧,"
-                    f"{total_count-rendered_count} 帧失败。可重新点「转换」或调小 chunk-size。"
-                )
-                log.warning(f"[转换] {os.path.basename(fr['path'])} 渲染不完整: {rendered_count}/{total_count}")
-                QMessageBox.warning(window, "渲染不完整",
-                    f"{os.path.basename(fr['path'])} 有 {total_count-rendered_count} 帧渲染失败。\n"
-                    f"可尝试:① 重新点「转换」 ② 调小「单块字节」(如改500)\n"
-                    f"详情见 sender_debug.log")
-
-        worker.frame_ready.connect(_frame)
-        worker.all_done.connect(_done)
-        worker.start()
-        fr["worker"] = worker  # 防 GC
 
     # ===== 播放单个文件(循环,边渲染边播放 + 缓冲)=====
     def play_file(row):
@@ -467,7 +487,7 @@ def run_gui() -> int:
             return
 
         result = cached["result"]
-        pixmaps = cached["pixmaps"]
+        pixmaps = cached["pixmaps"]  # PixmapLRUCache(按需渲染,内存恒定)
 
         play_state.update({
             "mode": "play", "current_row": row,
@@ -484,24 +504,8 @@ def run_gui() -> int:
         window.showFullScreen()
         app.processEvents()
 
-        # 若渲染未完成,继续后台渲染
-        if not cached.get("rendered"):
-            worker = MultiThreadRenderWorker(result.frames)
-            def _frame(idx, n, data):
-                pixmaps[idx] = pixmap_from_bytes(n, data)
-                play_state["render_done"] = len(pixmaps)
-            def _progress(done, total):
-                if play_state["mode"] == "play":
-                    play_info.setText(f"渲染中 {done}/{total} + 播放中…")
-            def _done():
-                cached["rendered"] = True
-                fr["rendered"] = True
-                file_table.item(row, 1).setText("已转换")
-            worker.frame_ready.connect(_frame)
-            worker.progress.connect(_progress)
-            worker.all_done.connect(_done)
-            worker.start()
-            play_state["render_worker"] = worker
+        # ★ 不预渲染全部帧(会爆内存)。播放时 on_tick 按需即时渲染当前帧(LRU 缓存)。
+        # 可选:后台预热当前帧之后的少量帧(预读,让播放更顺)。这里保持简单,纯按需。
 
         # 启动播放定时器
         timer = QTimer(window)
@@ -511,17 +515,27 @@ def run_gui() -> int:
         play_state["timer"] = timer
         play_info.setText(f"播放 {os.path.basename(fr['path'])}  第 1/{loops_spin.value()} 轮")
 
-    # ===== 播放循环(缓冲策略:渲染领先才播,否则等下一 tick)=====
+    # ===== 播放循环(按需即时渲染当前帧,LRU 缓存防爆内存)=====
     def on_tick():
         if play_state.get("mode") != "play":
             return
         idx = play_state["idx"]
         pixmaps = play_state["pixmaps"]
-        # 该帧未就绪 → 等下个 tick(渲染会很快补上)
-        if idx not in pixmaps:
-            play_info.setText(f"等待渲染第 {idx+1}/{play_state['total']} 帧…")
-            return
-        qr_label.setPixmap(scale_pixmap_to_label(pixmaps[idx]))
+        result = play_state["result"]
+        # ★ 即时渲染当前帧(若不在 LRU 缓存),单帧 ~50ms 很快
+        pm = pixmaps.get(idx)
+        if pm is None:
+            if not ensure_rendered(idx, pixmaps, result):
+                play_info.setText(f"第 {idx+1} 帧渲染失败,跳过")
+                play_state["idx"] += 1
+                if play_state["idx"] >= play_state["total"]:
+                    play_state["round"] += 1
+                    play_state["idx"] = 0
+                    if play_state["round"] >= play_state["loops"]:
+                        finish_playback(True)
+                return
+            pm = pixmaps.get(idx)
+        qr_label.setPixmap(scale_pixmap_to_label(pm))
         done = play_state["round"] * play_state["total"] + idx + 1
         allf = play_state["total"] * play_state["loops"]
         pct = int(done / allf * 100) if allf else 0
@@ -617,11 +631,12 @@ def run_gui() -> int:
             QMessageBox.critical(window, "显帧错误", f"显帧出错: {e}\n详情见 sender_debug.log")
 
     def display_single(idx):
-        """显示单帧(已确保渲染)。"""
+        """显示单帧(已确保渲染)。pixmaps 是 PixmapLRUCache。"""
         pixmaps = play_state["pixmaps"]
-        if idx not in pixmaps:
+        pm = pixmaps.get(idx)
+        if pm is None:
             return
-        qr_label.setPixmap(scale_pixmap_to_label(pixmaps[idx]))
+        qr_label.setPixmap(scale_pixmap_to_label(pm))
         total = play_state["total"]
         play_info.setText(f"显示第 {idx+1}/{total} 帧(← → 翻页,ESC 返回)")
 
@@ -686,10 +701,15 @@ def run_gui() -> int:
         }
         with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False)
-        # 存每帧 PNG
+        # ★ 存每帧 PNG:按需渲染(LRU 可能没缓存该帧),渲染完即存盘即释放
         from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
         saved = 0
-        for idx in range(len(result.frames)):
+        total_frames = len(result.frames)
+        for idx in range(total_frames):
+            # ensure_rendered 会渲染并放进 LRU(可能淘汰旧的,内存恒定)
+            if not ensure_rendered(idx, pixmaps, result):
+                log.warning(f"[保存] 帧 {idx} 渲染失败,跳过")
+                continue
             pm = pixmaps.get(idx)
             if pm is None:
                 continue
@@ -700,7 +720,7 @@ def run_gui() -> int:
                 pf.write(bytes(buf.buffer()))
             saved += 1
             if saved % 50 == 0:
-                status_label.setText(f"保存中 {saved}/{len(result.frames)} …")
+                status_label.setText(f"保存中 {saved}/{total_frames} …(按需渲染,内存安全)")
                 app.processEvents()
         status_label.setText(f"✓ 已保存 {saved} 帧到 {d}")
 
@@ -736,24 +756,40 @@ def run_gui() -> int:
         from bridge.sender.builder import BuildResult
         result = BuildResult(sid=meta.get("sid", ""), frames=frames,
                              file_count=1, total_data_chunks=total_data_chunks)
-        # 加载 PNG
-        pixmaps = {}
-        from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
+        # ★ 用 LRU 缓存(防爆内存),并记录帧 PNG 目录供缓存未命中时从磁盘回源
+        load_dir = d
+        class _DiskBackedLRU(PixmapLRUCache):
+            """LRU 缓存,未命中时从磁盘加载 PNG(而非重新渲染)。"""
+            def get(self, idx):
+                pm = super().get(idx)
+                if pm is not None:
+                    return pm
+                # 从磁盘加载
+                png_path = os.path.join(load_dir, f"frame_{idx:05d}.png")
+                if os.path.isfile(png_path):
+                    pm = QPixmap()
+                    if pm.load(png_path):
+                        self.put(idx, pm)
+                        return pm
+                return None
+        pixmaps = _DiskBackedLRU(max_size=30)
+        # 预加载前几帧(让首屏快速显示)
         loaded = 0
-        for idx in range(total):
+        for idx in range(min(total, 30)):
             png_path = os.path.join(d, f"frame_{idx:05d}.png")
             if not os.path.isfile(png_path):
                 continue
             pm = QPixmap()
             if pm.load(png_path):
-                pixmaps[idx] = pm
+                pixmaps.put(idx, pm)
                 loaded += 1
-            if loaded % 50 == 0:
-                status_label.setText(f"加载中 {loaded}/{total} …")
-                app.processEvents()
-        if loaded == 0:
+        # 统计总可用帧
+        total_avail = sum(1 for idx in range(total)
+                          if os.path.isfile(os.path.join(d, f"frame_{idx:05d}.png")))
+        if total_avail == 0:
             QMessageBox.critical(window, "错误", "没有加载到任何帧 PNG。")
             return
+        loaded = total_avail
         # 用 meta 的路径+参数算 cache_key,存入缓存
         ck = compute_cache_key([meta["path"]], meta["chunk_size"],
                                meta["use_fec"], meta["fec_redundancy"])

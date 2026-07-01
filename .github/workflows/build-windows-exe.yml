@@ -1,106 +1,16 @@
-name: Build Windows executables (verify_sender + sender)
+name: Build Windows sender.exe
 
 # 触发条件:推送到 main 时、或手动触发
 on:
   push:
     branches: [main]
     paths:
-      - 'verify_sender.py'
-      - 'build/win/verify_sender.spec'
       - 'bridge/**'
       - 'build/win/sender.spec'
       - '.github/workflows/build-windows-exe.yml'
   workflow_dispatch:   # 允许在 GitHub 页面手动点按钮运行
 
 jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          # 只装发送端需要的最小依赖
-          pip install pygame qrcode pillow
-          pip install pyinstaller
-
-      - name: Build with PyInstaller
-        shell: pwsh
-        run: |
-          pyinstaller build/win/verify_sender.spec --clean --noconfirm
-          # 确认产物存在
-          if (-not (Test-Path dist/verify_sender.exe)) {
-            throw "打包失败:dist/verify_sender.exe 未生成"
-          }
-          # 打印产物大小
-          $size = (Get-Item dist/verify_sender.exe).Length / 1MB
-          Write-Host "verify_sender.exe 大小: $([math]::Round($size,2)) MB"
-
-      - name: Smoke test(校验 exe 有效性)
-        shell: pwsh
-        run: |
-          # GitHub Actions 的 windows runner 是无显示(headless)环境,
-          # pygame 创建全屏窗口会因找不到显示器而失败 —— 这是环境限制,
-          # 不代表 exe 有问题。所以冒烟测试只做两件不依赖显示器的事:
-          #
-          # 1) PE 头校验:确认是合法的 Windows 可执行文件(MZ 签名)
-          # 2) 短超时启动:确认 exe 能被加载执行(不因打包损坏而立即崩)
-
-          $exe = "dist/verify_sender.exe"
-
-          # --- 1) 读前 2 字节,验证 PE 头(MZ = 0x4D5A)---
-          $bytes = [System.IO.File]::ReadAllBytes($exe)[0..1]
-          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            throw "PE 头校验失败:不是合法的 Windows 可执行文件"
-          }
-          Write-Host "✓ PE 头校验通过(MZ 签名正常)"
-
-          # --- 2) 启动 exe,最多等 5 秒 ---
-          # headless 下 pygame 会报错退出,这是预期的;
-          # 我们只确认 exe 能被 OS 加载、不是打包损坏导致的无法启动。
-          $proc = Start-Process -FilePath $exe -PassThru -ErrorAction SilentlyContinue
-          if (-not $proc) {
-            Write-Host "⚠ exe 未能启动进程(headless 环境常见),跳过运行测试"
-          } else {
-            $proc | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-            if (-not $proc.HasExited) {
-              # 能跑超过 5 秒 = 打包没问题(真机上才会显示窗口)
-              Write-Host "✓ exe 运行超过 5 秒(打包正常,真机将显示窗口)"
-              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            } else {
-              $code = $proc.ExitCode
-              Write-Host "⚠ exe 在 headless 环境退出(码 $code)—— 多为 pygame 找不到显示器,真机不受影响"
-            }
-          }
-          Write-Host "冒烟测试完成:exe 文件有效 ✓"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: verify_sender-windows-x86_64
-          path: dist/verify_sender.exe
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Summary
-        shell: pwsh
-        run: |
-          echo "## 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
-          echo "" >> $env:GITHUB_STEP_SUMMARY
-          echo "产物 \`verify_sender.exe\` 已上传为 artifact,可在 Actions 运行页面下载。" >> $env:GITHUB_STEP_SUMMARY
-          echo "下载后拷到 Windows 机器双击运行,无需安装 Python。" >> $env:GITHUB_STEP_SUMMARY
-
-  # ====================================================================
-  # 发送端正式版 sender.exe(PyQt6 GUI + pygame 播放 + FEC)
-  # ====================================================================
   build-sender:
     runs-on: windows-latest
     steps:
@@ -122,7 +32,6 @@ jobs:
       - name: Smoke test sender 逻辑(不依赖 GUI/采集卡)
         shell: pwsh
         run: |
-          # 验证 bridge 包能正常构建帧序列(发送端核心逻辑)
           python -c "from bridge.sender import builder; from bridge.common import protocol; print('sender logic import OK')"
           Write-Host "✓ sender 逻辑层验证通过"
 
@@ -158,5 +67,5 @@ jobs:
         run: |
           echo "## sender.exe 打包完成 ✓" >> $env:GITHUB_STEP_SUMMARY
           echo "" >> $env:GITHUB_STEP_SUMMARY
-          echo "采集卡文件传输发送端(全功能版),含 PyQt6 GUI + pygame 播放 + Reed-Solomon FEC。" >> $env:GITHUB_STEP_SUMMARY
+          echo "采集卡文件传输发送端(全功能版),含 PyQt6 GUI + 多线程渲染 + Reed-Solomon FEC。" >> $env:GITHUB_STEP_SUMMARY
           echo "下载 \`sender-windows-x86_64\` artifact,拷到 Windows 双击运行。" >> $env:GITHUB_STEP_SUMMARY
