@@ -347,6 +347,7 @@ def run_gui() -> int:
             from concurrent.futures import ThreadPoolExecutor
             total = len(self.frames)
             done_count = 0
+            fail_count = 0
             # 用 ThreadPoolExecutor 并发渲染;帧完成后立即发信号(边渲染边播放)
             with ThreadPoolExecutor(max_workers=self.nthreads) as pool:
                 futs = {}
@@ -354,17 +355,29 @@ def run_gui() -> int:
                     if self._stop:
                         break
                     futs[pool.submit(render_matrix_bytes, payload, self.box, self.border)] = i
-                for fut in futs:  # 按提交顺序取(保证流式播放有序)
+                # 收集结果。失败的帧重试一次,仍失败则记录(不再静默丢弃)
+                for fut in futs:
                     if self._stop:
                         break
+                    idx = futs[fut]
                     try:
                         n, data = fut.result()
-                    except Exception:
-                        continue
-                    idx = futs[fut]
+                    except Exception as e:
+                        # 首次失败:重试一次
+                        log.warning(f"帧 {idx} 首次渲染失败({e}),重试中…")
+                        try:
+                            n, data = render_matrix_bytes(self.frames[idx], self.box, self.border)
+                        except Exception as e2:
+                            log.error(f"帧 {idx} 重试仍失败: {e2}")
+                            fail_count += 1
+                            continue
                     self.frame_ready.emit(idx, n, data)
                     done_count += 1
                     self.progress.emit(done_count, total)
+            if fail_count > 0:
+                log.error(f"渲染完成但有 {fail_count}/{total} 帧失败(已跳过)")
+            else:
+                log.info(f"全部 {total} 帧渲染完成")
             self.all_done.emit()
 
     # ===== 转换单个文件(多进程并行渲染)=====
@@ -415,10 +428,27 @@ def run_gui() -> int:
             file_table.item(row, 1).setText(f"渲染 {len(pixmaps)}/{len(result.frames)}")
 
         def _done():
-            render_cache[ck]["rendered"] = True
-            fr["rendered"] = True
-            file_table.item(row, 1).setText("已转换")
-            status_label.setText(f"✓ {os.path.basename(fr['path'])} 渲染完成(数据{result.total_data_chunks}块)。")
+            # ★ 根据实际渲染数判断完成状态(避免静默失败导致标记错误)
+            rendered_count = len(pixmaps)
+            total_count = len(result.frames)
+            fully_done = (rendered_count >= total_count)
+            render_cache[ck]["rendered"] = fully_done
+            fr["rendered"] = fully_done
+            if fully_done:
+                file_table.item(row, 1).setText("已转换")
+                status_label.setText(f"✓ {os.path.basename(fr['path'])} 渲染完成(数据{result.total_data_chunks}块)。")
+                log.info(f"[转换] {os.path.basename(fr['path'])} 全部 {total_count} 帧渲染完成")
+            else:
+                file_table.item(row, 1).setText(f"部分完成 {rendered_count}/{total_count}")
+                status_label.setText(
+                    f"⚠ {os.path.basename(fr['path'])} 只渲染 {rendered_count}/{total_count} 帧,"
+                    f"{total_count-rendered_count} 帧失败。可重新点「转换」或调小 chunk-size。"
+                )
+                log.warning(f"[转换] {os.path.basename(fr['path'])} 渲染不完整: {rendered_count}/{total_count}")
+                QMessageBox.warning(window, "渲染不完整",
+                    f"{os.path.basename(fr['path'])} 有 {total_count-rendered_count} 帧渲染失败。\n"
+                    f"可尝试:① 重新点「转换」 ② 调小「单块字节」(如改500)\n"
+                    f"详情见 sender_debug.log")
 
         worker.frame_ready.connect(_frame)
         worker.all_done.connect(_done)
@@ -521,10 +551,11 @@ def run_gui() -> int:
             result = cached["result"]
             total = len(result.frames)
             log.info(f"[显帧] 总帧数={total}, 已渲染={len(cached['pixmaps'])}, rendered={cached.get('rendered')}")
+            # ★ PyQt6 的 getInt 参数名是 min/max(非 PyQt5 的 minValue/maxValue)
             idx, ok = QInputDialog.getInt(
                 window, "显示指定帧",
                 f"输入要显示的帧号(1~{total}):\n(用于补扫接收端漏掉的某帧)\n显示后可用 ← → 翻页",
-                value=1, minValue=1, maxValue=total,
+                value=1, min=1, max=total,
             )
             if not ok:
                 log.info("[显帧] 用户取消输入")

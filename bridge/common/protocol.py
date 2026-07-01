@@ -34,8 +34,10 @@ from typing import Dict, List, Optional
 PROTOCOL_VERSION = 2
 
 # 单块最大"有效字节"数(Base64 编码后塞进二维码)。
-# 默认标准档:Version~20 的二维码可承载,采集卡 1080p 下清晰可解。
-DEFAULT_CHUNK_SIZE = 1000
+# ★ 默认 500:H容错下保证所有帧(含 FEC 冗余帧)的 JSON 不超 QR Version 40 容量。
+#   实测 chunk=1000 时部分帧达 1481B 超限渲染失败;chunk=500 最大 815B 全部安全。
+#   用户可在 UI 调大,但 safe_chunk_size_for_payload 会自动降级到 500 防超限。
+DEFAULT_CHUNK_SIZE = 500
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +235,19 @@ def fits_in_qr(payload: str, limit: int = QR_MAX_SAFE_PAYLOAD) -> bool:
 def safe_chunk_size_for_payload(chunk_size: int) -> int:
     """
     给定期望的 chunk_size,估算一个能保证帧 JSON 不超 QR 容量的值。
-    帧 JSON ≈ 元数据固定开销(~150B)+ data(base64,长度≈chunk_size)。
-    H容错下单帧 JSON 上限约 1200B → data 安全上限约 1000B。
+
+    ★ 必须同时覆盖:数据帧 和 FEC 冗余帧。
+      - 数据帧 payload ≈ 元数据 + base64(≈chunk_size)
+      - FEC 冗余帧 payload ≈ 元数据 + base64(冗余字节,长度≈chunk_len≈chunk_size)
+      实测:chunk=1000 时部分帧 JSON 达 1481B,超 Version40 容量渲染失败。
+      chunk=500 时最大 815B,全部安全。
+
+    留足余量:max_data = 500,对应最大 payload ~815B,远低于 1200B 上限。
     """
-    overhead = 200  # 元数据 + 边界余量
-    max_data = QR_MAX_SAFE_PAYLOAD - overhead  # ≈ 1000
+    max_data = 500  # 保守上限,确保数据帧+冗余帧都不超 QR Version 40
+    if chunk_size > max_data:
+        return max_data
+    return chunk_size
     if chunk_size > max_data:
         return max_data
     return chunk_size
