@@ -7,15 +7,21 @@ PyInstaller spec · verify_sender.exe
 - 显式收集 pygame / qrcode / pillow 的数据文件,避免缺资源。
 - 窗口模式(无控制台黑框):console=False。如需看报错,临时改 console=True。
 
-用法(在 Windows 上):
-    pip install pyinstaller pygame qrcode pillow
-    pyinstaller verify_sender.spec --clean --noconfirm
+用法(在仓库根目录执行,或在 build/win 下执行都行——spec 会自动定位根目录的脚本):
+    pyinstaller build/win/verify_sender.spec --clean --noconfirm
 产物: dist/verify_sender.exe
 """
 
+import os
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
+
+# 定位仓库根目录:本 spec 位于 <root>/build/win/ 下。
+# PyInstaller 注入 SPECPATH = spec 所在目录;根目录是其上两级。
+_ROOT = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
+# 入口脚本 verify_sender.py 位于仓库根目录。
+_ENTRY = os.path.join(_ROOT, "verify_sender.py")
 
 # 收集隐式数据文件(字体、图标、二进制资源)
 datas = []
@@ -29,8 +35,9 @@ hiddenimports += collect_submodules("pygame")
 hiddenimports += collect_submodules("qrcode")
 
 a = Analysis(
-    ["verify_sender.py"],
-    pathex=[],
+    [_ENTRY],
+    # 把仓库根目录加入搜索路径,确保 verify_sender.py 的依赖能被找到
+    pathex=[_ROOT],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
