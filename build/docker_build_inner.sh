@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export MIRROR="-i https://pypi.tuna.tsinghua.edu.cn/simple"
+export MIRROR=""
 
 echo "[1/6] Fixing CentOS 7 EOL repos + installing build tools..."
 sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo
@@ -28,8 +28,8 @@ echo "  Python: $($PY --version)"
 
 echo ""
 echo "[3/6] Installing Python deps..."
-$PY -m pip install --upgrade pip $MIRROR -q 2>&1 | tail -1
-$PY -m pip install --prefer-binary $MIRROR \
+$PY -m pip install --upgrade pip -q 2>&1 | tail -1
+$PY -m pip install --prefer-binary \
   "qrcode[pil]" "pillow>=10.0.0" zstandard reedsolo pyinstaller 2>&1 | tail -3
 
 echo ""

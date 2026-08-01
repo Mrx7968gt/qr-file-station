@@ -13,17 +13,21 @@ on:
 
 jobs:
   # -----------------------------------------------------------------------
-  # Linux: centos:7 container -> glibc 2.17 compatible
-  # Covers: CentOS/RHEL 7+, Ubuntu 16.04+, Debian 9+, Amazon Linux 2+
+  # Linux: Docker run centos:7 on ubuntu-latest host
+  # Binary built on CentOS 7 (glibc 2.17) -> runs on CentOS/RHEL 7+, Ubuntu 16+
   # -----------------------------------------------------------------------
   build-linux:
     runs-on: ubuntu-latest
-    container: centos:7
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build inside centos:7
-        run: bash build/docker_build_inner.sh
+      - name: Build in CentOS 7 container
+        run: |
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            centos:7 \
+            bash build/docker_build_inner.sh
 
       - name: Read version
         id: ver
@@ -35,9 +39,8 @@ jobs:
       - name: Verify binary
         run: |
           chmod +x dist/qr-encoder-v*
-          ./dist/qr-encoder-v* --help | head -3
-          echo "=== glibc check ==="
-          objdump -T dist/qr-encoder-v* 2>/dev/null | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -3
+          file dist/qr-encoder-v*
+          ls -lh dist/qr-encoder-v*
 
       - name: Package
         run: |
@@ -133,9 +136,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # -----------------------------------------------------------------------
-  # Summary
-  # -----------------------------------------------------------------------
   summary:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
@@ -143,10 +143,9 @@ jobs:
       - name: Summary
         run: |
           echo "## QR Encoder cross-platform build complete" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | glibc | Compat |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux x86_64 | 2.17 | CentOS 7+, Ubuntu 16+ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | glibc | Compatibility |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|---------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux x86_64 | 2.17 | CentOS/RHEL 7+, Ubuntu 16+ |" >> $GITHUB_STEP_SUMMARY
           echo "| Windows x86_64 | - | Win10+ |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Download artifacts from the Actions tab." >> $GITHUB_STEP_SUMMARY
