@@ -49,15 +49,23 @@ jobs:
       - name: Build libcimbar WASM
         run: |
           cd libcimbar
+          # Fix: OpenCV build_js.py puts opencv_modules.hpp in build subdir
+          # libcimbar expects it at opencv-build-wasm/build_wasm/opencv2/
+          OCV=$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm
+          find $OCV -name "opencv_modules.hpp" -exec cp {} $OCV/ \; 2>/dev/null || true
+          find $GITHUB_WORKSPACE/opencv/opencv-build-wasm -name "opencv_modules.hpp" 2>/dev/null
+          find $GITHUB_WORKSPACE/opencv/opencv-build-wasm -name "opencv_modules.hpp" -exec dirname {} \; 2>/dev/null
           mkdir -p build-wasm
           cd build-wasm
-          # Add OpenCV install include path (build_js.py puts generated headers there)
-          OPENCV_INSTALL=$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm/install
-          EXTRA_INCLUDES="-I${OPENCV_INSTALL}/include/opencv4"
-          emcmake cmake .. -DUSE_WASM=1 \
-            -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv \
-            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES}" 2>&1 | tail -10
+          emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv 2>&1 | tail -10
           make -j$(nproc) cimbar_js 2>&1 | tail -15
+
+      - name: Debug: find WASM output
+        run: |
+          echo "=== Looking for cimbar_js output ==="
+          find libcimbar/build-wasm -name "cimbar_js*" 2>/dev/null
+          find libcimbar/dist -name "cimbar_js*" 2>/dev/null
+          find libcimbar -name "cimbar_js.js" -o -name "cimbar_js.wasm" 2>/dev/null
 
       - name: Collect output
         run: |
