@@ -18,73 +18,43 @@ jobs:
           ref: master
           path: libcimbar
 
-      - name: Checkout OpenCV
-        uses: actions/checkout@v4
-        with:
-          repository: opencv/opencv
-          ref: 4.9.0
-          path: opencv
-
-      - name: Setup emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: 3.1.39
-
-      - name: Verify emscripten
-        run: emcc --version
-
-      - name: Install Python deps
-        run: pip install jinja2
-
-      - name: Build OpenCV for WASM
+      - name: Build in Docker (emscripten)
         run: |
-          cd opencv
-          mkdir -p opencv-build-wasm/build_wasm
-          cd opencv-build-wasm/build_wasm
-          python3 ../../../platforms/js/build_js.py build_wasm \
-            --build_wasm \
-            --emscripten_dir $EMSDK/upstream/emscripten \
-            --build_test=no 2>&1 | tail -10
-
-      - name: Fix OpenCV header location
-        run: |
-          OCV="$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm"
-          echo "=== Searching for opencv_modules.hpp ==="
-          find "$GITHUB_WORKSPACE/opencv" -name "opencv_modules.hpp"
-          # Copy generated header to where libcimbar expects it
-          HDR=$(find "$GITHUB_WORKSPACE/opencv" -name "opencv_modules.hpp" | head -1)
-          if [ -n "$HDR" ]; then
-            cp "$HDR" "$OCV/"
-            echo "Copied $HDR to $OCV/"
-          fi
-
-      - name: Build libcimbar WASM
-        run: |
-          cd libcimbar
-          mkdir -p build-wasm
-          cd build-wasm
-          emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv 2>&1 | tail -10
-          make -j$(nproc) cimbar_js 2>&1 | tail -15
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/libcimbar:/usr/src/app" \
+            emscripten/emsdk:3.1.39 \
+            bash -c '
+              set -e
+              cd /usr/src/app
+              apt-get update -qq && apt-get install -y -qq python3 > /dev/null 2>&1
+              
+              git clone --depth 1 --branch 4.9.0 https://github.com/opencv/opencv.git opencv4
+              cd opencv4
+              mkdir -p opencv-build-wasm && cd opencv-build-wasm
+              python3 ../platforms/js/build_js.py build_wasm \
+                --build_wasm \
+                --emscripten_dir /emsdk/upstream/emscripten \
+                --build_test=no
+              
+              cd /usr/src/app
+              source /emsdk/emsdk_env.sh
+              mkdir -p build-wasm && cd build-wasm
+              emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=/usr/src/app/opencv4
+              make -j$(nproc) cimbar_js
+              make install
+            '
 
       - name: Collect output
         run: |
           mkdir -p wasm-output
-          find libcimbar -name "cimbar_js.js" -exec cp {} wasm-output/ \; 2>/dev/null
-          find libcimbar -name "cimbar_js.wasm" -exec cp {} wasm-output/ \; 2>/dev/null
+          find libcimbar -name "cimbar_js.js" -exec cp {} wasm-output/ \;
+          find libcimbar -name "cimbar_js.wasm" -exec cp {} wasm-output/ \;
           cp libcimbar/web/recv-worker.js wasm-output/ 2>/dev/null || true
           cp libcimbar/web/recv.js wasm-output/ 2>/dev/null || true
           cp libcimbar/web/zstd.js wasm-output/ 2>/dev/null || true
-          echo "=== Output files ==="
           ls -lh wasm-output/
 
-      - name: Verify decoder exports
-        run: |
-          echo "=== Decoder exports ==="
-          grep -o "cimbard_[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "No decoder exports found"
-          echo "=== Encoder exports ==="
-          grep -o "cimbare_[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "No encoder exports found"
-
-      - name: Upload WASM decoder
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: cimbar-wasm-decoder
