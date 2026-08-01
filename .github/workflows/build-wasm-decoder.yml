@@ -46,47 +46,43 @@ jobs:
             --emscripten_dir $EMSDK/upstream/emscripten \
             --build_test=no 2>&1 | tail -10
 
+      - name: Fix OpenCV header location
+        run: |
+          OCV="$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm"
+          echo "=== Searching for opencv_modules.hpp ==="
+          find "$GITHUB_WORKSPACE/opencv" -name "opencv_modules.hpp"
+          # Copy generated header to where libcimbar expects it
+          HDR=$(find "$GITHUB_WORKSPACE/opencv" -name "opencv_modules.hpp" | head -1)
+          if [ -n "$HDR" ]; then
+            cp "$HDR" "$OCV/"
+            echo "Copied $HDR to $OCV/"
+          fi
+
       - name: Build libcimbar WASM
         run: |
           cd libcimbar
-          # Fix: OpenCV build_js.py puts opencv_modules.hpp in build subdir
-          # libcimbar expects it at opencv-build-wasm/build_wasm/opencv2/
-          OCV=$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm
-          find $OCV -name "opencv_modules.hpp" -exec cp {} $OCV/ \; 2>/dev/null || true
-          find $GITHUB_WORKSPACE/opencv/opencv-build-wasm -name "opencv_modules.hpp" 2>/dev/null
-          find $GITHUB_WORKSPACE/opencv/opencv-build-wasm -name "opencv_modules.hpp" -exec dirname {} \; 2>/dev/null
           mkdir -p build-wasm
           cd build-wasm
           emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv 2>&1 | tail -10
           make -j$(nproc) cimbar_js 2>&1 | tail -15
 
-      - name: Debug: find WASM output
-        run: |
-          echo "=== Looking for cimbar_js output ==="
-          find libcimbar/build-wasm -name "cimbar_js*" 2>/dev/null
-          find libcimbar/dist -name "cimbar_js*" 2>/dev/null
-          find libcimbar -name "cimbar_js.js" -o -name "cimbar_js.wasm" 2>/dev/null
-
       - name: Collect output
         run: |
           mkdir -p wasm-output
-          # Copy JS glue and WASM binary
-          find libcimbar/build-wasm -name "cimbar_js.js" -exec cp {} wasm-output/ \;
-          find libcimbar/build-wasm -name "cimbar_js.wasm" -exec cp {} wasm-output/ \;
-          find libcimbar/dist -name "cimbar_js.js" -exec cp {} wasm-output/ \; 2>/dev/null || true
-          find libcimbar/dist -name "cimbar_js.wasm" -exec cp {} wasm-output/ \; 2>/dev/null || true
-          # Copy web worker files
+          find libcimbar -name "cimbar_js.js" -exec cp {} wasm-output/ \; 2>/dev/null
+          find libcimbar -name "cimbar_js.wasm" -exec cp {} wasm-output/ \; 2>/dev/null
           cp libcimbar/web/recv-worker.js wasm-output/ 2>/dev/null || true
           cp libcimbar/web/recv.js wasm-output/ 2>/dev/null || true
           cp libcimbar/web/zstd.js wasm-output/ 2>/dev/null || true
+          echo "=== Output files ==="
           ls -lh wasm-output/
 
       - name: Verify decoder exports
         run: |
-          echo "=== Decoder function exports ==="
-          grep -o "_cimbard[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "Not found"
-          echo "=== Encoder function exports ==="
-          grep -o "_cimbare[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "Not found"
+          echo "=== Decoder exports ==="
+          grep -o "cimbard_[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "No decoder exports found"
+          echo "=== Encoder exports ==="
+          grep -o "cimbare_[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "No encoder exports found"
 
       - name: Upload WASM decoder
         uses: actions/upload-artifact@v4
