@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cimbar Web Decoder</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: 'SF Mono', 'Monaco', monospace; }
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+h1 { font-size: 1.4rem; margin-bottom: 16px; color: #00d4ff; }
+.main { display: flex; gap: 20px; flex-wrap: wrap; }
+.video-panel { flex: 1; min-width: 400px; }
+.info-panel { width: 350px; }
+.video-wrap { position: relative; background: #000; border-radius: 8px; overflow: hidden; }
+video { width: 100%; display: block; }
+canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+.btn { background: #16213e; color: #00d4ff; border: 1px solid #00d4ff; padding: 8px 20px;
+       border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.9rem; margin: 4px; }
+.btn:hover { background: #00d4ff; color: #16213e; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.stats { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+.stat-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.85rem; }
+.stat-label { color: #888; }
+.stat-val { color: #00d4ff; font-weight: bold; }
+.progress-bar { background: #0d1b2a; border-radius: 4px; height: 8px; margin-top: 8px; overflow: hidden; }
+.progress-fill { background: #00d4ff; height: 100%; transition: width 0.3s; width: 0%; }
+#status { padding: 8px; border-radius: 4px; margin: 8px 0; font-size: 0.85rem; }
+.log { background: #0d1b2a; border-radius: 8px; padding: 12px; max-height: 200px;
+       overflow-y: auto; font-size: 0.8rem; color: #6a6a6a; }
+.log div { padding: 2px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>cimbar Web Decoder</h1>
+<div class="main">
+<div class="video-panel">
+<div class="video-wrap">
+<video id="video" autoplay playsinline></video>
+<canvas id="overlay"></canvas>
+</div>
+<div style="margin-top: 12px;">
+<button class="btn" id="startBtn">Start Camera</button>
+<button class="btn" id="stopBtn" disabled>Stop</button>
+<button class="btn" id="snapBtn" disabled>Decode Frame</button>
+<label style="margin-left:12px; font-size:0.85rem; color:#888;">
+FPS: <input type="range" id="fpsSlider" min="1" max="15" value="5"
+  style="width:100px; vertical-align:middle;">
+<span id="fpsLabel">5</span>
+</label>
+</div>
+</div>
+<div class="info-panel">
+<div class="stats">
+<div class="stat-row"><span class="stat-label">Status</span><span class="stat-val" id="statusVal">Idle</span></div>
+<div class="stat-row"><span class="stat-label">Frames decoded</span><span class="stat-val" id="frameCount">0</span></div>
+<div class="stat-row"><span class="stat-label">Grid detected</span><span class="stat-val" id="gridStatus">No</span></div>
+<div class="stat-row"><span class="stat-label">Chunks collected</span><span class="stat-val" id="chunkCount">0 / 0</span></div>
+<div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+</div>
+<div id="status"></div>
+<div class="log" id="log"></div>
+</div>
+</div>
+</div>
+
+<script>
+// ---- cimbar format constants ----
+const CELL_SIZE = 8;
+const CELL_SPACING = 9;
+const CELL_OFFSET = 8;
+const CELLS_X = 112;
+const CELLS_Y = 112;
+const CORNER_PAD = 6;
+const BITS_PER_CELL = 6;
+const ECC_BYTES = 30;
+const ECC_BLOCK = 155;
+
+const COLORS = [
+    [0, 255, 0],     // 0: green
+    [0, 255, 255],   // 1: cyan
+    [255, 255, 0],   // 2: yellow
+    [255, 0, 255],   // 3: magenta
+];
+
+const SYMBOL_HASHES = [
+    0x0103070f1f3f7fn, 0x7f3f1f0f07030100n, 0x0080c0e0f0f8fcfen,
+    0xfefcf8f0e0c08000n, 0xe7e7e70000e7e7e7n, 0x991818ffff181899n,
+    0xc381183c3c1881c3n, 0xe7e7c3c381810000n, 0x3f0f030000030f3fn,
+    0x00030fffff0f0300n, 0x00c0f0fffff0c000n, 0x181818183c3c7e7en,
+    0x7e7e3c3c18181818n, 0xffff3c1881c3e7ffn, 0xf3e3c78f8fc7e3f3n,
+    0xe1e1c7c7e3e38787n,
+];
+
+// ---- Decoder ----
+
+function hammingDist(a, b) {
+    let x = a ^ b;
+    let count = 0;
+    while (x) { count += Number(x & 1n); x >>= 1n; }
+    return count;
+}
+
+function averageHash(pixels, threshold) {
+    // pixels: Uint8Array of 64 grayscale values (8x8)
+    let hash = 0n;
+    for (let i = 0; i < 64; i++) {
+        hash = (hash << 1n) | (pixels[i] > threshold ? 1n : 0n);
+    }
+    return hash;
+}
+
+function decodeSymbol(grayCell) {
+    let sum = 0;
+    for (let i = 0; i < 64; i++) sum += grayCell[i];
+    let threshold = sum / 64;
+    let h = averageHash(grayCell, threshold);
+    let bestSym = 0, bestDist = 1000;
+    for (let i = 0; i < 16; i++) {
+        let d = hammingDist(h, SYMBOL_HASHES[i]);
+        if (d < bestDist) { bestDist = d; bestSym = i; if (d === 0) break; }
+    }
+    return bestSym;
+}
+
+function decodeColor(rgbData) {
+    // rgbData: Uint8ClampedArray of 8x8x4 (RGBA), sample center 6x6
+    let r = 0, g = 0, b = 0, count = 0;
+    for (let y = 1; y < 7; y++) {
+        for (let x = 1; x < 7; x++) {
+            let idx = (y * 8 + x) * 4;
+            r += rgbData[idx]; g += rgbData[idx+1]; b += rgbData[idx+2];
+            count++;
+        }
+    }
+    r /= count; g /= count; b /= count;
+    let mx = Math.max(r, g, b, 1);
+    let mn = Math.min(r, g, b, 48);
+    if (mn >= mx) mn = 0;
+    let adj = 255 / (mx - mn);
+    r = Math.max(0, Math.min(255, (r - mn) * adj));
+    g = Math.max(0, Math.min(255, (g - mn) * adj));
+    b = Math.max(0, Math.min(255, (b - mn) * adj));
+
+    let bestFit = 0, bestDist = 1e18;
+    for (let i = 0; i < 4; i++) {
+        let [cr, cg, cb] = COLORS[i];
+        let dr = (r-g)-(cr-cg), dg = (g-b)-(cg-cb), db = (b-r)-(cb-cr);
+        let dist = dr*dr + dg*dg + db*db;
+        if (dist < bestDist) { bestDist = dist; bestFit = i; }
+    }
+    return bestFit;
+}
+
+function extractGrid(imageData, width, height) {
+    // imageData: Uint8ClampedArray RGBA
+    // Find grid: center crop to 1024x1024 if larger
+    let ox = 0, oy = 0, gw = width, gh = height;
+    if (width > 1024) { ox = Math.floor((width - 1024) / 2); gw = 1024; }
+    if (height > 1024) { oy = Math.floor((height - 1024) / 2); gh = 1024; }
+    if (gw < 1024 || gh < 1024) return null;
+
+    let bytes = [];
+    let bitBuf = 0, bitCnt = 0;
+    let cellCount = 0;
+
+    // Temporary buffers
+    const grayCell = new Uint8Array(64);
+    const rgbCell = new Uint8ClampedArray(64 * 4);
+
+    for (let row = 0; row < CELLS_Y; row++) {
+        for (let col = 0; col < CELLS_X; col++) {
+            // Skip corner regions
+            if ((row < CORNER_PAD && col < CORNER_PAD) ||
+                (row < CORNER_PAD && col >= CELLS_X - CORNER_PAD) ||
+                (row >= CELLS_Y - CORNER_PAD && col < CORNER_PAD) ||
+                (row >= CELLS_Y - CORNER_PAD && col >= CELLS_X - CORNER_PAD))
+                continue;
+
+            let px = ox + CELL_OFFSET + col * CELL_SPACING;
+            let py = oy + CELL_OFFSET + row * CELL_SPACING;
+
+            // Extract 8x8 cell
+            for (let cy = 0; cy < 8; cy++) {
+                for (let cx = 0; cx < 8; cx++) {
+                    let imgX = px + cx, imgY = py + cy;
+                    if (imgX >= width || imgY >= height) {
+                        grayCell[cy*8+cx] = 0;
+                        continue;
+                    }
+                    let idx = (imgY * width + imgX) * 4;
+                    let r = imageData[idx], g = imageData[idx+1], b = imageData[idx+2];
+                    rgbCell[(cy*8+cx)*4] = r;
+                    rgbCell[(cy*8+cx)*4+1] = g;
+                    rgbCell[(cy*8+cx)*4+2] = b;
+                    rgbCell[(cy*8+cx)*4+3] = 255;
+                    grayCell[cy*8+cx] = (r * 0.299 + g * 0.587 + b * 0.114) | 0;
+                }
+            }
+
+            let sym = decodeSymbol(grayCell);
+            let col_ = decodeColor(rgbCell);
+            let combined = (sym << 2) | col_;
+            bitBuf = (bitBuf << 6) | combined;
+            bitCnt += 6;
+            while (bitCnt >= 8) {
+                bitCnt -= 8;
+                bytes.push((bitBuf >> bitCnt) & 0xFF);
+            }
+            cellCount++;
+        }
+    }
+
+    return { bytes: new Uint8Array(bytes), cellCount };
+}
+
+// ---- UI logic ----
+
+let video = document.getElementById('video');
+let overlay = document.getElementById('overlay');
+let ctx = overlay.getContext('2d');
+let stream = null;
+let decoding = false;
+let frameCount = 0;
+let decodeTimer = null;
+let hiddenCanvas = document.createElement('canvas');
+let hiddenCtx = hiddenCanvas.getContext('2d', { willReadFrequently: true });
+
+function log(msg) {
+    let el = document.getElementById('log');
+    let div = document.createElement('div');
+    div.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+    el.insertBefore(div, el.firstChild);
+}
+
+function setStatus(text, color) {
+    let el = document.getElementById('status');
+    el.textContent = text;
+    el.style.color = color || '#888';
+}
+
+async function startCamera() {
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+        });
+        video.srcObject = stream;
+        await video.play();
+
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        hiddenCanvas.width = video.videoWidth;
+        hiddenCanvas.height = video.videoHeight;
+
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = false;
+        document.getElementById('snapBtn').disabled = false;
+        document.getElementById('statusVal').textContent = 'Camera active';
+        setStatus('Camera started. Point at cimbar display.', '#00d4ff');
+        log('Camera started: ' + video.videoWidth + 'x' + video.videoHeight);
+
+        startDecoding();
+    } catch (e) {
+        setStatus('Camera error: ' + e.message, '#ff4444');
+        log('Error: ' + e.message);
+    }
+}
+
+function stopCamera() {
+    if (decodeTimer) { clearInterval(decodeTimer); decodeTimer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    document.getElementById('startBtn').disabled = false;
+    document.getElementById('stopBtn').disabled = true;
+    document.getElementById('snapBtn').disabled = true;
+    document.getElementById('statusVal').textContent = 'Stopped';
+}
+
+function startDecoding() {
+    let fps = parseInt(document.getElementById('fpsSlider').value);
+    let interval = 1000 / fps;
+    if (decodeTimer) clearInterval(decodeTimer);
+    decodeTimer = setInterval(decodeOneFrame, interval);
+}
+
+function decodeOneFrame() {
+    if (!video.videoWidth) return;
+    let w = video.videoWidth, h = video.videoHeight;
+    hiddenCtx.drawImage(video, 0, 0, w, h);
+    let imgData = hiddenCtx.getImageData(0, 0, w, h);
+
+    let result = extractGrid(imgData.data, w, h);
+
+    if (result) {
+        frameCount++;
+        document.getElementById('frameCount').textContent = frameCount;
+        document.getElementById('gridStatus').textContent = 'Yes';
+        document.getElementById('gridStatus').style.color = '#00ff88';
+
+        // Draw detection box
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+        let ox = Math.floor((w - 1024) / 2);
+        let oy = Math.floor((h - 1024) / 2);
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(ox, oy, 1024, 1024);
+
+        setStatus('Frame ' + frameCount + ': ' + result.cellCount + ' cells, ' +
+                   result.bytes.length + ' bytes', '#00ff88');
+        log('Decoded frame ' + frameCount + ': ' + result.bytes.length + ' bytes');
+    } else {
+        document.getElementById('gridStatus').textContent = 'No';
+        document.getElementById('gridStatus').style.color = '#ff6666';
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+}
+
+document.getElementById('startBtn').onclick = startCamera;
+document.getElementById('stopBtn').onclick = stopCamera;
+document.getElementById('snapBtn').onclick = decodeOneFrame;
+document.getElementById('fpsSlider').oninput = function() {
+    document.getElementById('fpsLabel').textContent = this.value;
+    if (decodeTimer) startDecoding();
+};
+
+log('cimbar Web Decoder ready. Click Start Camera to begin.');
+</script>
+</body>
+</html>
