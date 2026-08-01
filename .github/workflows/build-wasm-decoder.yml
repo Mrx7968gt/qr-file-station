@@ -51,7 +51,12 @@ jobs:
           cd libcimbar
           mkdir -p build-wasm
           cd build-wasm
-          emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv 2>&1 | tail -10
+          # Add OpenCV install include path (build_js.py puts generated headers there)
+          OPENCV_INSTALL=$GITHUB_WORKSPACE/opencv/opencv-build-wasm/build_wasm/install
+          EXTRA_INCLUDES="-I${OPENCV_INSTALL}/include/opencv4"
+          emcmake cmake .. -DUSE_WASM=1 \
+            -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv \
+            -DCMAKE_CXX_FLAGS="${EXTRA_INCLUDES}" 2>&1 | tail -10
           make -j$(nproc) cimbar_js 2>&1 | tail -15
 
       - name: Collect output
