@@ -1,0 +1,22 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+LABEL maintainer="qr-file-station"
+LABEL version="2.0.0"
+LABEL description="QR File Station v3 encoder with zstd compression and LT fountain codes"
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY bridge/ ./bridge/
+COPY qr_encoder.py .
+
+RUN mkdir -p /data/input /data/output
+
+ENTRYPOINT ["python", "qr_encoder.py"]
+CMD ["--help"]

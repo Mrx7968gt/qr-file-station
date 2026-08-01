@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """
-bridge.receiver.assembler — 拼装层
+bridge.receiver.assembler - Frame assembly layer (v2 + v3)
 
-职责:
-    维护"会话 → 文件块缓冲"状态机。接收解码后的帧,按 sid 分组,
-    去重累积 data 帧;当某个文件收齐(或靠 FEC 恢复)时拼装落盘。
-
-设计要点(移植自前端 FileAssembler.tsx,并增强 FEC):
-    - 按 (sid, filename) 维护独立缓冲,received_chunks: {index -> data}
-    - 重复 index 直接覆盖(去重)
-    - 见 start 帧 → 重置该 sid 的缓冲
-    - 见 end 帧 → 尝试收尾(检查是否所有文件都齐)
-    - FEC:若 start 帧带 fec 元信息,数据块不足时尝试用冗余块恢复
-
-落盘目录:./recv/(可配置)
+v3: fountain (LT) decode or sequential collect -> zstd decompress -> save
+v2: base64 assemble + RS FEC recovery (legacy)
 """
 
 from __future__ import annotations
@@ -22,19 +12,90 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-from bridge.common import protocol
+from bridge.common import protocol as v2proto
+from bridge.common import binproto
+from bridge.fec import fountain as lt
 from bridge.fec import rs_codec as fec
 
 
 @dataclass
-class FileBuffer:
-    """单个文件的接收缓冲。"""
+class V3FileBuffer:
     filename: str
-    total: int                                  # 数据块总数
-    received: Dict[int, str] = field(default_factory=dict)   # index -> data(base64 片段)
-    size: int = 0                               # 原始文件字节数
-    # FEC 相关(可选)
-    fec_chunks: Dict[int, bytes] = field(default_factory=dict)  # 冗余块序号 -> bytes
+    k: int
+    block_size: int
+    compressed_len: int
+    orig_size: int
+    fountain: bool
+    received_count: int = 0
+    lt_decoder: Optional[lt.LTDecoder] = None
+    seq_chunks: Dict[int, bytes] = field(default_factory=dict)
+    completed: bool = False
+
+    def init_decoder(self):
+        if self.fountain and self.lt_decoder is None and self.k > 0:
+            self.lt_decoder = lt.LTDecoder(self.k, self.block_size)
+
+    def add_block(self, seed: int, payload: bytes) -> bool:
+        if self.completed:
+            return False
+        self.received_count += 1
+        if self.fountain:
+            self.init_decoder()
+            if self.lt_decoder is not None:
+                self.lt_decoder.add_block(seed, payload)
+                if self.received_count >= self.k:
+                    return self.try_decode()
+            return False
+        else:
+            self.seq_chunks[seed] = payload
+            if len(self.seq_chunks) >= self.k:
+                return self.try_assemble_seq()
+            return False
+
+    def try_decode(self) -> bool:
+        if self.lt_decoder is None or self.completed:
+            return False
+        decoded = self.lt_decoder.decode()
+        if decoded is None:
+            return False
+        return self._finalize(decoded)
+
+    def try_assemble_seq(self) -> bool:
+        if len(self.seq_chunks) < self.k or self.completed:
+            return False
+        ordered = []
+        for i in range(self.k):
+            c = self.seq_chunks.get(i)
+            if c is None:
+                return False
+            ordered.append(c)
+        return self._finalize(ordered)
+
+    def _finalize(self, chunks: List[bytes]) -> bool:
+        try:
+            raw_padded = b"".join(chunks)
+            compressed = raw_padded[:self.compressed_len]
+            if self.orig_size > 0:
+                raw = binproto.decompress(compressed)
+            else:
+                raw = b""
+        except Exception:
+            return False
+        self._decoded_raw = raw
+        self.completed = True
+        return True
+
+    def get_raw(self) -> Optional[bytes]:
+        return getattr(self, "_decoded_raw", None)
+
+
+@dataclass
+class FileBuffer:
+    filename: str
+    total: int
+    received: Dict[int, str] = field(default_factory=dict)
+    size: int = 0
+    fec_chunks: Dict[int, bytes] = field(default_factory=dict)
     fec_meta: Optional[fec.FECMeta] = None
 
     @property
@@ -43,32 +104,19 @@ class FileBuffer:
 
     @property
     def is_complete_by_count(self) -> bool:
-        """仅凭数据块数判断是否收齐。"""
         return len(self.received) >= self.total
 
     def recovered_raw_chunks(self) -> Optional[List[bytes]]:
-        """
-        尝试用 FEC 恢复缺失的数据块。
-
-        Returns:
-            恢复后的原始字节块列表(对应 protocol 的 base64 解码前),
-            或 None(未启用 FEC / 收到的块不足以恢复)
-        """
         if self.fec_meta is None or self.fec_meta.n == self.fec_meta.k:
-            return None  # 未启用 FEC
-
+            return None
         meta = self.fec_meta
-        # 组装 {块序号 -> 字节}:数据块是 base64 片段编码后的字节
         received: Dict[int, bytes] = {}
         for idx, b64frag in self.received.items():
             received[idx] = b64frag.encode("ascii")
-        # 冗余块
         for idx, chunk in self.fec_chunks.items():
             received[meta.k + idx] = chunk
-
         if len(received) < meta.k:
-            return None  # 不足
-
+            return None
         recovered = fec.decode(received, meta)
         if recovered is None:
             return None
@@ -77,161 +125,189 @@ class FileBuffer:
 
 @dataclass
 class SessionState:
-    """单个会话(sid)的状态。"""
     sid: str
-    files: Dict[str, FileBuffer] = field(default_factory=dict)  # filename -> buffer
-    expected_files: List[Dict] = field(default_factory=list)     # start 帧里的文件清单
-    completed: List[str] = field(default_factory=list)           # 已落盘的文件名
+    proto: int = 3
+    files: Dict = field(default_factory=dict)
+    expected_files: List = field(default_factory=list)
+    completed: List[str] = field(default_factory=list)
+    manifest: Optional[dict] = None
+    _fec_by_file: Dict = field(default_factory=dict)
+    _fec_meta: Optional[fec.FECMeta] = None
 
 
 class Assembler:
-    """
-    接收端拼装器。
-
-    用法:
-        asm = Assembler(out_dir="./recv")
-        for frame in decoded_frames:
-            done_files = asm.handle_frame(frame)
-            # done_files 是本次新落盘的文件路径列表
-    """
-
-    def __init__(
-        self,
-        out_dir: str = "./recv",
-        on_file_done: Optional[Callable[[str, str], None]] = None,
-    ):
-        """
-        Args:
-            out_dir: 落盘目录
-            on_file_done: 回调(filename, saved_path),文件拼装落盘后调用
-        """
+    def __init__(self, out_dir="./recv", on_file_done=None):
         self.out_dir = out_dir
         self.on_file_done = on_file_done
         self.sessions: Dict[str, SessionState] = {}
         os.makedirs(out_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 帧处理
-    # ------------------------------------------------------------------
     def handle_frame(self, frame: Dict) -> List[str]:
-        """
-        处理一帧,返回本次新落盘的文件路径列表(通常为空)。
-
-        帧类型:
-            start → 重置该 sid,记录文件清单和 FEC 元信息
-            data  → 累积到对应文件缓冲,收齐则拼装落盘
-            end   → 尝试对所有未完成的文件做 FEC 恢复收尾
-        """
-        # ★ 类型防御:非法帧(非 dict / 缺字段)直接丢弃,避免崩溃
         if not isinstance(frame, dict):
             return []
         ftype = frame.get("type")
         sid = frame.get("sid", "")
         if not sid:
             return []
+        proto = frame.get("proto", 2)
+        if proto == 3:
+            return self._handle_v3(frame, sid, ftype)
+        return self._handle_v2(frame, sid, ftype)
 
+    def _handle_v3(self, frame, sid, ftype):
         if ftype == "start":
-            self._handle_start(frame)
-            return []
+            return self._v3_start(frame, sid)
         if ftype == "data":
-            return self._handle_data(frame)
+            return self._v3_data(frame, sid)
         if ftype == "end":
-            return self._handle_end(frame)
+            return self._v3_end(frame, sid)
         return []
 
-    def _handle_start(self, frame: Dict) -> None:
-        sid = frame["sid"]
-        # 新会话:重置缓冲
-        self.sessions[sid] = SessionState(sid=sid)
-        sess = self.sessions[sid]
+    def _v3_start(self, frame, sid):
+        sess = SessionState(sid=sid, proto=3)
+        self.sessions[sid] = sess
+        manifest = frame.get("manifest", {})
+        sess.manifest = manifest
+        use_fountain = manifest.get("fountain", True)
+        for f_info in manifest.get("files", []):
+            fname = f_info["filename"]
+            buf = V3FileBuffer(
+                filename=fname,
+                k=f_info.get("k", 0),
+                block_size=f_info.get("block_size", 0),
+                compressed_len=f_info.get("compressed_len", 0),
+                orig_size=f_info.get("size", 0),
+                fountain=use_fountain,
+            )
+            sess.files[fname] = buf
+        return []
+
+    def _v3_data(self, frame, sid):
+        sess = self.sessions.get(sid)
+        if sess is None:
+            sess = SessionState(sid=sid, proto=3)
+            self.sessions[sid] = sess
+        fname = frame.get("filename", "")
+        buf = sess.files.get(fname)
+        if buf is None:
+            buf = V3FileBuffer(
+                filename=fname,
+                k=frame.get("k", 0),
+                block_size=len(frame.get("payload", b"")),
+                compressed_len=0,
+                orig_size=frame.get("filesize", 0),
+                fountain=frame.get("fountain", False),
+            )
+            sess.files[fname] = buf
+        just_done = buf.add_block(frame.get("seed", 0), frame.get("payload", b""))
+        if just_done and fname not in sess.completed:
+            return self._save_v3(sess, buf)
+        return []
+
+    def _v3_end(self, frame, sid):
+        sess = self.sessions.get(sid)
+        if sess is None:
+            return []
+        saved = []
+        for fname, buf in sess.files.items():
+            if fname in sess.completed:
+                continue
+            if buf.fountain:
+                buf.try_decode()
+            else:
+                buf.try_assemble_seq()
+            if buf.completed:
+                saved += self._save_v3(sess, buf)
+        return saved
+
+    def _save_v3(self, sess, buf):
+        raw = buf.get_raw()
+        if raw is None:
+            return []
+        safe_name = os.path.basename(buf.filename)
+        path = os.path.join(self.out_dir, safe_name)
+        with open(path, "wb") as f:
+            f.write(raw)
+        sess.completed.append(buf.filename)
+        if self.on_file_done:
+            self.on_file_done(safe_name, path)
+        return [path]
+
+    def _handle_v2(self, frame, sid, ftype):
+        if ftype == "start":
+            self._v2_start(frame, sid)
+            return []
+        if ftype == "data":
+            return self._v2_data(frame, sid)
+        if ftype == "end":
+            return self._v2_end(frame, sid)
+        return []
+
+    def _v2_start(self, frame, sid):
+        sess = SessionState(sid=sid, proto=2)
+        self.sessions[sid] = sess
         sess.expected_files = frame.get("files", [])
-        # FEC 元信息:新协议按文件名下发(per_file_fec = {filename: FECMeta.to_dict()})
-        # 兼容旧协议:若 fec 是单个 dict(非 {filename:...}),则对所有文件用同一份
         fec_field = frame.get("fec")
-        fec_by_file: Dict[str, "fec.FECMeta"] = {}
+        fec_by_file = {}
         if fec_field:
             if isinstance(fec_field, dict) and all(
                 isinstance(v, dict) for v in fec_field.values()
             ):
-                # 新协议:{filename: meta_dict}
                 for fname, meta_d in fec_field.items():
                     try:
                         fec_by_file[fname] = fec.FECMeta.from_dict(meta_d)
                     except Exception:
                         pass
             else:
-                # 旧协议:单个 meta dict,存为占位
                 try:
-                    sess._fec_meta = fec.FECMeta.from_dict(fec_field)  # noqa: SLF001
+                    sess._fec_meta = fec.FECMeta.from_dict(fec_field)
                 except Exception:
                     pass
-        sess._fec_by_file = fec_by_file  # noqa: SLF001
+        sess._fec_by_file = fec_by_file
 
-    def _handle_data(self, frame: Dict) -> List[str]:
-        sid = frame["sid"]
+    def _v2_data(self, frame, sid):
         sess = self.sessions.get(sid)
         if sess is None:
-            # 漏了 start,按需新建
-            sess = SessionState(sid=sid)
+            sess = SessionState(sid=sid, proto=2)
             self.sessions[sid] = sess
-
-        # 校验未通过则丢弃
-        if not protocol.verify_chunk(frame):
+        if not v2proto.verify_chunk(frame):
             return []
-
         fname = frame["filename"]
         buf = sess.files.get(fname)
         if buf is None:
-            # FEC 元信息优先取自 start 帧的 per_file_fec(按文件名);
-            # 回退取自旧协议的 session._fec_meta
             fec_by_file = getattr(sess, "_fec_by_file", {}) or {}
             fec_meta = fec_by_file.get(fname)
             if fec_meta is None:
                 fec_meta = getattr(sess, "_fec_meta", None)
             buf = FileBuffer(
-                filename=fname,
-                total=frame["total"],
-                size=frame.get("size", 0),
-                fec_meta=fec_meta,
+                filename=fname, total=frame["total"],
+                size=frame.get("size", 0), fec_meta=fec_meta,
             )
             sess.files[fname] = buf
-
-        # 冗余块还是数据块?由发送端在 extra 字段标记 is_fec。
-        # 帧里 data 字段始终是 base64 字符串:
-        #   - 数据块:文件 base64 片段(直接用于拼装)
-        #   - 冗余块:冗余二进制字节的 base64(需解码回字节再传给 FEC)
         if frame.get("is_fec"):
             import base64 as _b64
             buf.fec_chunks[frame["index"]] = _b64.b64decode(frame["data"])
         else:
             buf.received[frame["index"]] = frame["data"]
-
-        # 收齐则落盘
         if buf.is_complete_by_count and fname not in sess.completed:
-            return self._try_assemble(sess, fname)
+            return self._v2_assemble(sess, fname)
         return []
 
-    def _handle_end(self, frame: Dict) -> List[str]:
-        """end 帧:对未完成的文件尝试 FEC 恢复后落盘。"""
-        sid = frame["sid"]
+    def _v2_end(self, frame, sid):
         sess = self.sessions.get(sid)
         if sess is None:
             return []
-        saved: List[str] = []
+        saved = []
         for fname, buf in sess.files.items():
             if fname in sess.completed:
                 continue
             if buf.is_complete_by_count:
-                saved += self._try_assemble(sess, fname)
+                saved += self._v2_assemble(sess, fname)
             else:
-                # 尝试 FEC 恢复
-                saved += self._try_fec_assemble(sess, fname)
+                saved += self._v2_fec_assemble(sess, fname)
         return saved
 
-    # ------------------------------------------------------------------
-    # 落盘
-    # ------------------------------------------------------------------
-    def _try_assemble(self, sess: SessionState, fname: str) -> List[str]:
+    def _v2_assemble(self, sess, fname):
         buf = sess.files[fname]
         try:
             chunks = [
@@ -239,17 +315,16 @@ class Assembler:
                  "size": buf.size, "data": buf.received[i], "checksum": 0}
                 for i in range(buf.total)
             ]
-            _, _, raw = protocol.assemble(chunks)
+            _, _, raw = v2proto.assemble(chunks)
         except ValueError:
             return []
         return self._save(sess, fname, raw)
 
-    def _try_fec_assemble(self, sess: SessionState, fname: str) -> List[str]:
+    def _v2_fec_assemble(self, sess, fname):
         buf = sess.files[fname]
         recovered = buf.recovered_raw_chunks()
         if recovered is None:
             return []
-        # 拼接所有恢复出的 base64 片段 → 解码
         try:
             full_b64 = "".join(c.decode("ascii") for c in recovered)
             import base64
@@ -258,8 +333,7 @@ class Assembler:
             return []
         return self._save(sess, fname, raw)
 
-    def _save(self, sess: SessionState, fname: str, raw: bytes) -> List[str]:
-        # 防目录穿越:只取文件名部分
+    def _save(self, sess, fname, raw):
         safe_name = os.path.basename(fname)
         path = os.path.join(self.out_dir, safe_name)
         with open(path, "wb") as f:
@@ -269,17 +343,19 @@ class Assembler:
             self.on_file_done(safe_name, path)
         return [path]
 
-    # ------------------------------------------------------------------
-    # 状态查询(供 UI 展示进度)
-    # ------------------------------------------------------------------
-    def progress(self) -> Dict[str, Dict]:
-        """返回各文件的接收进度 {filename: {received, total, done}}。"""
-        result: Dict[str, Dict] = {}
+    def progress(self):
+        result = {}
         for sess in self.sessions.values():
             for fname, buf in sess.files.items():
+                if isinstance(buf, V3FileBuffer):
+                    received = buf.received_count
+                    total = buf.k
+                else:
+                    received = buf.have_data_count
+                    total = buf.total
                 result[fname] = {
-                    "received": buf.have_data_count,
-                    "total": buf.total,
+                    "received": received,
+                    "total": total,
                     "done": fname in sess.completed,
                 }
         return result

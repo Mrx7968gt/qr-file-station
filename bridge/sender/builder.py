@@ -1,85 +1,86 @@
 #!/usr/bin/env python3
 """
-bridge.sender.builder — 发送端构建层
+bridge.sender.builder - v3 build layer
 
-职责:
-    把文件/目录 → QR 帧 Surface 序列(待播放)。
-    这是 GUI 和 CLI 共用的核心逻辑,与 pygame 渲染解耦,便于单测。
+Pipeline: file -> zstd compress -> chunk -> (optional LT fountain) -> binary frames
 
-流程:
-    1. 文件分块(protocol.encode_file)
-    2. 可选 FEC 加冗余(fec.encode),冗余字节 base64 编码进帧
-    3. 拼装 start + data + (fec) + end 帧序列
-    4. 每帧 → JSON → QR 矩阵 → pygame Surface
+Protocol v3 improvements:
+  - zstd compression before chunking
+  - Binary frames (no JSON/Base64 overhead)
+  - QR M-level error correction (more capacity per code)
+  - LT fountain codes (no multi-loop needed)
+  - Backward-compatible v2 path retained
 """
 
 from __future__ import annotations
 
-import base64
 import io
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 import qrcode
 
-from bridge.common import protocol
-from bridge.fec import rs_codec as fec
+from bridge.common import protocol as v2proto
+from bridge.common import binproto
+from bridge.fec import fountain as lt
+
+QR_ERROR_CORRECT = qrcode.constants.ERROR_CORRECT_M
 
 
 @dataclass
 class BuildResult:
-    """一次构建的结果。"""
     sid: str
-    frames: List[str]          # 每帧的 JSON 字符串(塞进 QR)
+    sid_bytes: bytes
+    frames: List
     file_count: int
     total_data_chunks: int
+    manifest: dict = field(default_factory=dict)
+    protocol_version: int = 3
 
 
-def _qr_to_image(payload: str, box: int = 10, border: int = 4):
-    """生成 QR Image(PIL)。"""
+def _qr_matrix_bytes(payload, box: int = 10, border: int = 4):
     qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=box,
-        border=border,
+        version=None, error_correction=QR_ERROR_CORRECT,
+        box_size=box, border=border,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    modules = len(matrix)
+    n = modules * box
+    data = bytearray(n * n)
+    for r in range(modules):
+        row_base = r * box
+        for c in range(modules):
+            val = 0 if matrix[r][c] else 255
+            for dr in range(box):
+                base = (row_base + dr) * n
+                for dc in range(box):
+                    data[base + c * box + dc] = val
+    return n, bytes(data)
+
+
+def _qr_to_image(payload, box: int = 10, border: int = 4):
+    qr = qrcode.QRCode(
+        version=None, error_correction=QR_ERROR_CORRECT,
+        box_size=box, border=border,
     )
     qr.add_data(payload)
     qr.make(fit=True)
     return qr.make_image(fill_color="black", back_color="white")
 
 
-def payload_to_png_bytes(payload: str, box: int = 10, border: int = 4) -> bytes:
-    """帧 JSON → QR PNG 字节(供播放器加载或落盘)。"""
+def payload_to_png_bytes(payload, box: int = 10, border: int = 4) -> bytes:
     img = _qr_to_image(payload, box, border).convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def build(
-    paths: List[str],
-    chunk_size: int = protocol.DEFAULT_CHUNK_SIZE,
-    use_fec: bool = True,
-    fec_redundancy: float = 0.1,
-    box: int = 10,
-    border: int = 4,
-) -> BuildResult:
-    """
-    构建一个会话的所有 QR 帧(不含 pygame Surface,只产 JSON 字符串)。
-
-    Args:
-        paths: 文件路径列表(目录会被展开)
-        chunk_size: 单块有效字节
-        use_fec: 是否启用 FEC
-        fec_redundancy: FEC 冗余比例
-        box/border: QR 渲染参数
-
-    Returns:
-        BuildResult(frames=[JSON 字符串,...])
-    """
-    # 展开目录,收集所有文件
+def _collect_files(paths: List[str]) -> List[Path]:
     files: List[Path] = []
     for p in paths:
         pp = Path(p)
@@ -90,37 +91,122 @@ def build(
                         files.append(Path(root) / fn)
         elif pp.is_file():
             files.append(pp)
+    return files
 
+
+def build(
+    paths: List[str],
+    chunk_size: int = binproto.DEFAULT_CHUNK_SIZE_V3,
+    use_fountain: bool = True,
+    fountain_redundancy: float = 0.5,
+    use_fec: bool = False,
+    compress_level: int = 9,
+    box: int = 10,
+    border: int = 4,
+    protocol_version: int = 3,
+    fec_redundancy: float = 0.1,
+) -> BuildResult:
+    if protocol_version == 2:
+        return _build_v2(paths, chunk_size or v2proto.DEFAULT_CHUNK_SIZE,
+                         use_fec, fec_redundancy, box, border)
+    return _build_v3(paths, chunk_size, use_fountain,
+                     fountain_redundancy, compress_level, box, border)
+
+
+def _build_v3(
+    paths, chunk_size, use_fountain, fountain_redundancy,
+    compress_level, box, border,
+) -> BuildResult:
+    files = _collect_files(paths)
     if not files:
-        raise ValueError("没有找到可传输的文件")
+        raise ValueError("No files found to transmit")
 
-    # ★ 安全降级:chunk_size 过大时帧 JSON 会超 QR Version 40 容量(2953B)。
-    # 自动降到安全值,避免生成超大二维码导致编码失败。
-    safe_max = protocol.safe_chunk_size_for_payload(chunk_size)
+    sid_bytes = binproto.new_sid_bytes()
+    sid_hex = binproto.sid_to_hex(sid_bytes)
+
+    frames: List[bytes] = []
+    manifest_files = []
+    total_source_blocks = 0
+
+    for fp in files:
+        safe_cs = binproto.safe_chunk_size_v3(chunk_size, fp.name)
+        _, chunks, orig_size, fname = binproto.encode_file_v3(
+            fp, chunk_size=safe_cs, sid=sid_bytes,
+            compress_level=compress_level,
+        )
+        k = len(chunks)
+        total_source_blocks += k
+        block_size = max(len(c) for c in chunks) if chunks else 0
+        compressed_len = sum(len(c) for c in chunks)
+
+        if use_fountain and k > 1:
+            enc = lt.LTEncoder(chunks)
+            num_blocks = max(int(k * (1.0 + fountain_redundancy)), k + 1)
+            for block_id, payload in enc.generate(num_blocks):
+                frame = binproto.pack_data_frame(
+                    sid_bytes, block_id, k, orig_size, fname, payload,
+                    flags=binproto.FLAG_COMPRESSED | binproto.FLAG_FOUNTAIN,
+                )
+                frames.append(frame)
+        else:
+            for i, chunk in enumerate(chunks):
+                frame = binproto.pack_data_frame(
+                    sid_bytes, i, k, orig_size, fname, chunk,
+                    flags=binproto.FLAG_COMPRESSED,
+                )
+                frames.append(frame)
+
+        manifest_files.append({
+            "filename": fname,
+            "size": orig_size,
+            "k": k,
+            "block_size": block_size,
+            "compressed_len": compressed_len,
+        })
+
+    manifest = {
+        "v": binproto.PROTOCOL_VERSION,
+        "files": manifest_files,
+        "chunk_size": chunk_size,
+        "fountain": use_fountain,
+        "total_source_blocks": total_source_blocks,
+    }
+    start_frame = binproto.pack_start_frame(
+        sid_bytes, json.dumps(manifest, ensure_ascii=False)
+    )
+    end_frame = binproto.pack_end_frame(sid_bytes)
+    frames.insert(0, start_frame)
+    frames.append(end_frame)
+
+    return BuildResult(
+        sid=sid_hex, sid_bytes=sid_bytes, frames=frames,
+        file_count=len(files), total_data_chunks=total_source_blocks,
+        manifest=manifest, protocol_version=3,
+    )
+
+
+def _build_v2(
+    paths, chunk_size, use_fec, fec_redundancy, box, border,
+) -> BuildResult:
+    import base64
+    from bridge.fec import rs_codec as fec
+
+    files = _collect_files(paths)
+    if not files:
+        raise ValueError("No files found to transmit")
+
+    safe_max = v2proto.safe_chunk_size_for_payload(chunk_size)
     if chunk_size > safe_max:
         chunk_size = safe_max
 
-    sid = protocol.new_sid()
-
-    # 逐文件分块
-    # FEC 采用"文件级"分组:每个文件独立做 RS 纠错,manifest 记录每文件元信息。
-    # FEC 元信息按文件存进 per_file_fec,最终一次性放进 start 帧下发,
-    # 避免每帧重复携带(导致 lengths 数组膨胀、可能超 QR 容量)。
-    all_data_chunks: List[dict] = []   # 每个含 filename/size/index/total/data
-    file_manifest: List[dict] = []     # [{filename, size, chunks}]
-    per_file_fec: dict = {}            # filename -> FECMeta.to_dict()
-
-    # 注意:为了让 FEC 能跨文件恢复,我们给所有块的 index 做全局编号。
-    # 但接收端 assembler 按 (sid, filename) 分组,且期望 index 在文件内 0-based。
-    # 因此 FEC 采用"文件级"分组:每个文件独立做 FEC,manifest 记录每文件元信息。
-    # start 帧只下发该文件的 fec 元信息的话,需要按文件分别存。
-    # 简化:每个文件独立 encode_file + 独立 FEC,帧里带 filename,接收端自然分文件拼装。
-
+    sid = v2proto.new_sid()
     frames_json: List[str] = []
+    file_manifest = []
+    per_file_fec = {}
     total_data_chunks = 0
 
     for fp in files:
-        data_chunks = protocol.encode_file(fp, chunk_size=chunk_size, sid=sid)
+        data_chunks = v2proto.encode_file(fp, chunk_size=chunk_size, sid=sid)
         k = len(data_chunks)
         total_data_chunks += k
         file_manifest.append({
@@ -129,9 +215,8 @@ def build(
             "chunks": k,
         })
 
-        # FEC:对该文件的 base64 片段做块级 RS
-        fec_meta: Optional[fec.FECMeta] = None
-        fec_payloads: List[tuple] = []  # (j, base64_of_redundancy)
+        fec_meta = None
+        fec_payloads = []
         if use_fec and k > 1:
             frag_bytes = [c["data"].encode("ascii") for c in data_chunks]
             try:
@@ -141,43 +226,35 @@ def build(
                     for j, fc in enumerate(fec_chunks)
                 ]
             except fec.FECError:
-                fec_meta = None  # 块太多超 RS 上限,降级为无 FEC
+                fec_meta = None
 
-        # 构造该文件的 data 帧 + fec 帧
-        # ★ FEC 元信息只放进 start 帧一次(避免每帧重复携带 lengths 数组导致膨胀/超 QR 容量)。
-        # 接收端在 start 帧拿到 FECMeta 后,后续 data/fec 帧无需再带。
-        # data 帧:不带 fec extra
         for c in data_chunks:
-            frame = protocol.make_data_chunk(
+            frame = v2proto.make_data_chunk(
                 c["filename"], c["size"], c["index"], c["total"],
                 c["data"], sid,
             )
-            frames_json.append(protocol.dumps(frame))
+            frames_json.append(v2proto.dumps(frame))
 
-        # fec 帧:只标 is_fec,不带完整 fec meta
         for j, payload in fec_payloads:
-            frame = protocol.make_data_chunk(
-                fp.name, c["size"], j, k, payload, sid,
+            frame = v2proto.make_data_chunk(
+                fp.name, data_chunks[0]["size"], j, k, payload, sid,
                 extra={"is_fec": True},
             )
-            frames_json.append(protocol.dumps(frame))
+            frames_json.append(v2proto.dumps(frame))
 
-        # 记录该文件的 FEC 元信息,放进 start 帧
         if fec_meta:
             per_file_fec[fp.name] = fec_meta.to_dict()
 
-    # 前后插哨兵帧。start 帧携带每文件的 FEC 元信息(一次性下发)
     start_extra = {"fec": per_file_fec} if per_file_fec else None
-    start_frame = protocol.make_start_frame(
+    start_frame = v2proto.make_start_frame(
         sid, file_manifest, total_data_chunks, extra=start_extra
     )
-    end_frame = protocol.make_end_frame(sid)
-    frames_json.insert(0, protocol.dumps(start_frame))
-    frames_json.append(protocol.dumps(end_frame))
+    end_frame = v2proto.make_end_frame(sid)
+    frames_json.insert(0, v2proto.dumps(start_frame))
+    frames_json.append(v2proto.dumps(end_frame))
 
     return BuildResult(
-        sid=sid,
-        frames=frames_json,
-        file_count=len(files),
-        total_data_chunks=total_data_chunks,
+        sid=sid, sid_bytes=b"", frames=frames_json,
+        file_count=len(files), total_data_chunks=total_data_chunks,
+        protocol_version=2,
     )

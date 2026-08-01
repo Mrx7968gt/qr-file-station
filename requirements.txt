@@ -1,2 +1,4 @@
-qrcode[pil]>=7.4.2,<8.0
-pillow>=9.5.0,<10.0
+qrcode[pil]>=7.4.2
+pillow>=10.0.0
+zstandard>=0.22.0
+reedsolo>=1.7.0

@@ -44,7 +44,7 @@ hiddenimports = []
 hiddenimports += collect_submodules("qrcode")
 hiddenimports += collect_submodules("bridge")
 # reedsolo 是纯 Python 单文件,显式声明
-hiddenimports += ["reedsolo"]
+hiddenimports += ["reedsolo", "zstandard"]
 # Qt 常见隐式依赖
 hiddenimports += ["PyQt6.sip"]
 # 渲染用多线程(ThreadPoolExecutor),需 concurrent.futures

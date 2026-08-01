@@ -1,0 +1,152 @@
+name: Build QR Encoder (cross-platform)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'qr_encoder.py'
+      - 'bridge/**'
+      - 'build/**'
+      - 'requirements.txt'
+      - '.github/workflows/build-encoder.yml'
+  workflow_dispatch:
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Linux: centos:7 container -> glibc 2.17 compatible
+  # Covers: CentOS/RHEL 7+, Ubuntu 16.04+, Debian 9+, Amazon Linux 2+
+  # -----------------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    container: centos:7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside centos:7
+        run: bash build/docker_build_inner.sh
+
+      - name: Read version
+        id: ver
+        run: |
+          BINARY=$(ls dist/qr-encoder-v* | head -1)
+          VER=$(basename "$BINARY" | grep -oP 'v[0-9.]+' | head -1 | sed 's/v//')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Verify binary
+        run: |
+          chmod +x dist/qr-encoder-v*
+          ./dist/qr-encoder-v* --help | head -3
+          echo "=== glibc check ==="
+          objdump -T dist/qr-encoder-v* 2>/dev/null | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -3
+
+      - name: Package
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p pkg/qr-encoder-linux-x86_64
+          cp dist/qr-encoder-v* pkg/qr-encoder-linux-x86_64/qr-encoder
+          chmod +x pkg/qr-encoder-linux-x86_64/qr-encoder
+          cat > pkg/qr-encoder-linux-x86_64/README.txt <<'EOF'
+          QR File Station v3 Encoder - Linux x86_64
+          Built on CentOS 7 (glibc 2.17)
+          Compatible: CentOS/RHEL 7+, Ubuntu 16.04+, Debian 9+
+          Usage: ./qr-encoder encode /path/to/files -o /path/to/output
+          EOF
+          cd pkg && tar czf ../qr-encoder-v${VER}-linux-x86_64.tar.gz qr-encoder-linux-x86_64
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qr-encoder-v${{ steps.ver.outputs.version }}-linux-x86_64
+          path: dist/qr-encoder-v*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: qr-encoder-v${{ steps.ver.outputs.version }}-linux-x86_64-tarball
+          path: qr-encoder-*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  # -----------------------------------------------------------------------
+  # Windows: native windows-latest runner
+  # -----------------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          python bridge/tests/test_binproto.py
+          python bridge/tests/test_fountain.py
+          python bridge/tests/test_loopback_v3.py
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $verLine = Get-Content bridge/version.py | Select-String 'VERSION = "([^"]+)"'
+          $ver = $verLine.Matches.Groups[1].Value
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Build encoder.exe
+        shell: pwsh
+        run: |
+          pyinstaller build/encoder.spec --clean --noconfirm
+          $exe = "dist/qr-encoder-v${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) { throw "Build failed: $exe not found" }
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host "$exe size: $([math]::Round($size,2)) MB"
+
+      - name: Verify PE header
+        shell: pwsh
+        run: |
+          $exe = "dist/qr-encoder-v${{ steps.ver.outputs.version }}.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)[0..1]
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "PE header check failed" }
+          Write-Host "PE header OK (MZ signature valid)"
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "dist/qr-encoder-v${{ steps.ver.outputs.version }}.exe"
+          Set-Content -Path test.txt -Value "hello world test data"
+          & $exe stats test.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qr-encoder-v${{ steps.ver.outputs.version }}-windows-x86_64
+          path: dist/qr-encoder-v*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # -----------------------------------------------------------------------
+  # Summary
+  # -----------------------------------------------------------------------
+  summary:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## QR Encoder cross-platform build complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | glibc | Compat |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux x86_64 | 2.17 | CentOS 7+, Ubuntu 16+ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows x86_64 | - | Win10+ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download artifacts from the Actions tab." >> $GITHUB_STEP_SUMMARY
