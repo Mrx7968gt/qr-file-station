@@ -1,0 +1,84 @@
+name: Build WASM Decoder
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-wasm-decoder.yml'
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout libcimbar
+        uses: actions/checkout@v4
+        with:
+          repository: sz3/libcimbar
+          ref: master
+          path: libcimbar
+
+      - name: Checkout OpenCV
+        uses: actions/checkout@v4
+        with:
+          repository: opencv/opencv
+          ref: 4.9.0
+          path: opencv
+
+      - name: Setup emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.39
+
+      - name: Verify emscripten
+        run: emcc --version
+
+      - name: Install Python deps
+        run: pip install jinja2
+
+      - name: Build OpenCV for WASM
+        run: |
+          cd opencv
+          mkdir -p opencv-build-wasm/build_wasm
+          cd opencv-build-wasm/build_wasm
+          python3 ../../../platforms/js/build_js.py build_wasm \
+            --build_wasm \
+            --emscripten_dir $EMSDK/upstream/emscripten \
+            --build_test=no 2>&1 | tail -10
+
+      - name: Build libcimbar WASM
+        run: |
+          cd libcimbar
+          mkdir -p build-wasm
+          cd build-wasm
+          emcmake cmake .. -DUSE_WASM=1 -DOPENCV_DIR=$GITHUB_WORKSPACE/opencv 2>&1 | tail -10
+          make -j$(nproc) cimbar_js 2>&1 | tail -15
+
+      - name: Collect output
+        run: |
+          mkdir -p wasm-output
+          # Copy JS glue and WASM binary
+          find libcimbar/build-wasm -name "cimbar_js.js" -exec cp {} wasm-output/ \;
+          find libcimbar/build-wasm -name "cimbar_js.wasm" -exec cp {} wasm-output/ \;
+          find libcimbar/dist -name "cimbar_js.js" -exec cp {} wasm-output/ \; 2>/dev/null || true
+          find libcimbar/dist -name "cimbar_js.wasm" -exec cp {} wasm-output/ \; 2>/dev/null || true
+          # Copy web worker files
+          cp libcimbar/web/recv-worker.js wasm-output/ 2>/dev/null || true
+          cp libcimbar/web/recv.js wasm-output/ 2>/dev/null || true
+          cp libcimbar/web/zstd.js wasm-output/ 2>/dev/null || true
+          ls -lh wasm-output/
+
+      - name: Verify decoder exports
+        run: |
+          echo "=== Decoder function exports ==="
+          grep -o "_cimbard[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "Not found"
+          echo "=== Encoder function exports ==="
+          grep -o "_cimbare[a-z_]*" wasm-output/cimbar_js.js 2>/dev/null | sort -u || echo "Not found"
+
+      - name: Upload WASM decoder
+        uses: actions/upload-artifact@v4
+        with:
+          name: cimbar-wasm-decoder
+          path: wasm-output/
+          if-no-files-found: error
+          retention-days: 90
