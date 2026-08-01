@@ -13,34 +13,48 @@ on:
 
 jobs:
   # -----------------------------------------------------------------------
-  # Linux: Docker run centos:7 on ubuntu-latest host
-  # Binary built on CentOS 7 (glibc 2.17) -> runs on CentOS/RHEL 7+, Ubuntu 16+
+  # Linux: ubuntu-22.04 runner (glibc 2.35)
+  # Compatible: Ubuntu 22.04+, Debian 12+, RHEL 9+, CentOS Stream 9+
   # -----------------------------------------------------------------------
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Build in CentOS 7 container
+      - name: Install dependencies
         run: |
-          docker run --rm \
-            -v "$(pwd):/src" \
-            -w /src \
-            centos:7 \
-            bash build/docker_build_inner.sh
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Run tests
+        run: |
+          python bridge/tests/test_binproto.py
+          python bridge/tests/test_fountain.py
+          python bridge/tests/test_loopback_v3.py
 
       - name: Read version
         id: ver
         run: |
-          BINARY=$(ls dist/qr-encoder-v* | head -1)
-          VER=$(basename "$BINARY" | grep -oP 'v[0-9.]+' | head -1 | sed 's/v//')
+          VER=$(python -c "exec(open('bridge/version.py').read()); print(VERSION)")
           echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        run: |
+          pyinstaller build/encoder.spec --clean --noconfirm
+          chmod +x dist/qr-encoder-v*
 
       - name: Verify binary
         run: |
-          chmod +x dist/qr-encoder-v*
           file dist/qr-encoder-v*
           ls -lh dist/qr-encoder-v*
+          echo "=== glibc requirement ==="
+          objdump -T dist/qr-encoder-v* 2>/dev/null | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -3
+          echo "=== Smoke test ==="
+          echo "hello world compression test data" > /tmp/smoke.txt
+          ./dist/qr-encoder-v* stats /tmp/smoke.txt
 
       - name: Package
         run: |
@@ -48,10 +62,10 @@ jobs:
           mkdir -p pkg/qr-encoder-linux-x86_64
           cp dist/qr-encoder-v* pkg/qr-encoder-linux-x86_64/qr-encoder
           chmod +x pkg/qr-encoder-linux-x86_64/qr-encoder
-          cat > pkg/qr-encoder-linux-x86_64/README.txt <<'EOF'
-          QR File Station v3 Encoder - Linux x86_64
-          Built on CentOS 7 (glibc 2.17)
-          Compatible: CentOS/RHEL 7+, Ubuntu 16.04+, Debian 9+
+          cat > pkg/qr-encoder-linux-x86_64/README.txt <<EOF
+          QR File Station v${VER} Encoder - Linux x86_64
+          Built on Ubuntu 22.04 (glibc 2.35)
+          Compatible: Ubuntu 22.04+, Debian 12+, RHEL/CentOS 9+
           Usage: ./qr-encoder encode /path/to/files -o /path/to/output
           EOF
           cd pkg && tar czf ../qr-encoder-v${VER}-linux-x86_64.tar.gz qr-encoder-linux-x86_64
@@ -143,9 +157,9 @@ jobs:
       - name: Summary
         run: |
           echo "## QR Encoder cross-platform build complete" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | glibc | Compatibility |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|---------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux x86_64 | 2.17 | CentOS/RHEL 7+, Ubuntu 16+ |" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows x86_64 | - | Win10+ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Runner | Compatibility |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|---------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux x86_64 | Ubuntu 22.04 | Ubuntu 22+, Debian 12+, RHEL/CentOS 9+ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows x86_64 | windows-latest | Win10+ |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Download artifacts from the Actions tab." >> $GITHUB_STEP_SUMMARY
